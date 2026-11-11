@@ -4,7 +4,10 @@
     import { onMount } from 'svelte';
     import { base } from '$app/paths';
     import Icon from "@iconify/svelte";
- 
+    import { computeNodePositions } from './sankeyLayout.js';
+    import { computeEnergyLayout } from './energyLayout.js';
+    import { buildNodeTable } from './tableLayout.js';
+
     const sspMapping = { 'ssp3': 'Low', 'ssp5': 'High', };
     const rcpMapping = { 'rcp45': 'Low', 'rcp85': 'High',};
     const climateMapping = { 'cooler': 'Cooler', 'hotter': 'Hotter', };
@@ -18,10 +21,39 @@
         { label: 'High', value: '3' }
     ];
 
+    let energyNodeTable = null;
+    let layoutWarnings = [];
+
+    // This is the actual Sankey trace height used by the layout solver.
+    // Controls are placed in Plotly's bottom margin, not inside this area.
+    const PLOT_HEIGHT_PX = 600;
+    const NODE_PAD_PX = 18;
+
+    async function fetchParquet(fileName) {
+        const response = await fetch(`${base}/${fileName}`);
+
+        if (!response.ok) {
+            throw new Error(`Failed to fetch ${fileName}: ${response.status}`);
+        }
+
+        const file = await response.arrayBuffer();
+        let rows = [];
+
+        await parquetRead({
+            file,
+            rowFormat: 'object',
+            onComplete: (data) => {
+                rows = data;
+            }
+        });
+
+        return rows;
+    }
+
     // 8 rows x 12 columns US cartogram layout
     const stateGrid = [
         ['AK', null, null, null, null, null, null, null, null, null, null, 'ME'],
-        [null, null, null, null, null, null, 'WI', null, null, null, 'VT', 'NH'],
+        [null, null, null, null, null, 'WI', null, null, null, null, 'VT', 'NH'],
         ['WA', 'ID', 'MT', 'ND', 'MN', 'IL', 'MI', null, 'NY', 'MA', null, null],
         ['OR', 'NV', 'WY', 'SD', 'IA', 'IN', 'OH', 'PA', 'NJ', 'CT', 'RI', null],
         ['CA', 'UT', 'CO', 'NE', 'MO', 'KY', 'WV', 'VA', 'MD', 'DE', null, null],
@@ -50,11 +82,15 @@
 
     let energywaterdata;
     let gcamEnergyData = null;
+    let loadedDetailLevel = null;
+    let energyLevelDataCache = {};
+    let pendingLevelPromises = {};
     let isLoadingEnergyData = false;
     let selectedStates = ['WA'];
     let selectedDetailLevel = '1'; // maps to 1, 2, 3 (always includes level 0)
     let renderCounter = 0;
     let currentSelectedYear = null;
+    let layoutErrorMessage = '';
 
     const rcpRegex = /rcp[0-9]+/i;
     const sspRegex = /ssp[0-9]+/i;
@@ -278,6 +314,13 @@
         selectedStates = ['WA'];
     }
 
+    function resetLayout() {
+        // Re-render
+        if (activeData) {
+            initializeHybridSankey(activeData, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel, selectedColorPalette);
+        }
+    }
+
     // Generate Sankey frames by year and scenario
     function generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
         let filteredData;
@@ -287,11 +330,11 @@
             const matchingRows = data.filter(row => 
                 stateSet.has(row.region) && 
                 row.ssp === selectedSSP && 
-                row.rcp === selectedRCP && 
-                (String(row.level) === '0' || String(row.level) === '0.0' || String(row.level) === String(currentDetailLevel))
+                row.rcp === selectedRCP 
             );
 
-            // Sum flows across multiple selected states
+            // Sum flows across multiple selected states.
+            // Node colors come from the nodes parquet, not the edge rows.
             const aggregatedMap = new Map();
             matchingRows.forEach(row => {
                 const key = `${row.year}|||${row.source}|||${row.target}`;
@@ -301,8 +344,10 @@
                         year: row.year,
                         source: row.source,
                         target: row.target,
-                        source_color: row.source_color,
-                        target_color: row.target_color,
+                        source_color: energyNodeTable?.get(row.source)?.color ?? null,
+                        target_color: energyNodeTable?.get(row.target)?.color ?? null,
+                        source_position: row.source_position,
+                        target_position: row.target_position,
                         value: val,
                         units: row.units
                     });
@@ -329,42 +374,60 @@
             labels.add(row.target);
         });
 
-        const labelsArray = [...labels];
+        // One fixed layout for every frame -> no node drift during animation
+        let nodeX, nodeY;
+        let labelsArray;
+        try {
+            const layoutRes = selectedDiagram === 'Energy'
+                ? computeEnergyLayout([...labels], filteredData, energyNodeTable, currentDetailLevel,
+                    { padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX })
+                : computeNodePositions([...labels], filteredData,
+                    { strict: true, padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX });
+            layoutWarnings = layoutRes.warnings ?? [];
+            labelsArray = layoutRes.labels; // Use the canonical deterministically sorted label order!
+            nodeX = layoutRes.x;
+            nodeY = layoutRes.y;
+            
+            layoutErrorMessage = '';
+        } catch (err) {
+            console.error('Sankey layout error:', err);
+            layoutErrorMessage = err.message || 'Layout constraint conflict detected.';
+            return { frames: [], labels: [...labels] };
+        }
 
         const energyWaterNodeColors = labelsArray.map((label) => {
             const nodeType = getEnergyWaterNodeType(label, filteredData);
             return energyWaterPalette[nodeType];
         });
 
-        // apply custom coordinates to "Wind" only if the diagram is "Energy & Water"
-        if ('Energy & Water' === selectedDiagram) {
-            const windIndex = labelsArray.indexOf("Wind");
-            if (windIndex !== -1) { xCoords[windIndex] = 0.335; yCoords[windIndex] = 0.05; }
-        }
+        const finalNodeY = nodeY;
+
+        const pos = new Map(labelsArray.map((l, i) => [l, { x: nodeX[i], y: finalNodeY[i], c: energyWaterNodeColors[i] }]));
 
         years.forEach(year => {
-            const yearData = filteredData.filter(row => row.year === year);
+            const yearData = filteredData.filter(row => row.year === year && Number(row.value) > 0);
+            const used = new Set(yearData.flatMap(row => [row.source, row.target]));
+            const frameLabels = labelsArray.filter(l => used.has(l));
+            const idx = new Map(frameLabels.map((l, i) => [l, i]));
+
             const sources = [];
             const targets = [];
             const values = [];
             const linkColors = [];
             const flowHoverLabels = [];
             const nodeColors = selectedColorPalette === 'energy-water'
-                ? [...energyWaterNodeColors]
-                : Array(labelsArray.length).fill(null);
-            
+                ? frameLabels.map(l => pos.get(l).c)
+                : frameLabels.map(l =>
+                    (selectedDiagram === 'Energy' ? energyNodeTable?.get(l)?.color : null) ?? null
+                );
+
             yearData.forEach(row => {
-                const sIdx = labelsArray.indexOf(row.source);
-                const tIdx = labelsArray.indexOf(row.target);
+                const sIdx = idx.get(row.source);
+                const tIdx = idx.get(row.target);
                 sources.push(sIdx);
                 targets.push(tIdx);
                 values.push(parseFloat(row.value));
-
-                // Color edges by interpolation of source and target color
                 linkColors.push(getLinkColor(row, selectedColorPalette));
-
-                // Preserve original node colors for interpolation/source modes.
-                // The fixed Energy & Water palette already assigned node colors above.
                 if (selectedColorPalette !== 'energy-water') {
                     if (row.source_color) nodeColors[sIdx] = row.source_color;
                     if (row.target_color) nodeColors[tIdx] = row.target_color;
@@ -376,17 +439,18 @@
                 name: year,
                 data: [{
                     type: "sankey",
+                    arrangement: "perpendicular",
                     valueformat: '.3r',
                     orientation: "h",
                     node: {
-                        pad: 15,
+                        pad: NODE_PAD_PX,
                         thickness: 20,
                         line: { color: "black", width: 0.5 },
-                        label: labelsArray,
+                        label: frameLabels,
                         hoverinfo: "none",
                         color: nodeColors,
-                        x: xCoords,
-                        y: yCoords
+                        x: frameLabels.map(l => pos.get(l).x),
+                        y: frameLabels.map(l => pos.get(l).y)
                     },
                     link: {
                         source: sources,
@@ -394,7 +458,7 @@
                         value: values,
                         color: linkColors,
                         customdata: flowHoverLabels,
-                        hovertemplate: "Source: %{source.label}<br>Target: %{target.label}<br>Value: %{customdata}<extra></extra>"
+                        hovertemplate: "Source: %{source.label}<br>Target: %{customdata}<extra></extra>"
                     }
                 }]
             });
@@ -403,20 +467,25 @@
         return { frames, labels: labelsArray };
     }
 
-    async function loadGcamEnergyData() {
-        if (gcamEnergyData || isLoadingEnergyData) return;
+    async function loadParquetLevel(levelKey) {
+        if (energyLevelDataCache[levelKey]) {
+            return energyLevelDataCache[levelKey];
+        }
 
-        isLoadingEnergyData = true;
+        if (pendingLevelPromises[levelKey]) {
+            return pendingLevelPromises[levelKey];
+        }
 
-        try {
-            const response = await fetch(`${base}/gcam_usa_energy.parquet`);
+        const fileName = `gcam_usa_energy_l${levelKey}.parquet`;
+
+        pendingLevelPromises[levelKey] = (async () => {
+            const response = await fetch(`${base}/${fileName}`);
 
             if (!response.ok) {
-                throw new Error(`Failed to fetch parquet file: ${response.status}`);
+                throw new Error(`Failed to fetch parquet file (${fileName}): ${response.status}`);
             }
 
             const arrayBuffer = await response.arrayBuffer();
-
             let parsedRows = [];
 
             await parquetRead({
@@ -427,11 +496,7 @@
                 }
             });
 
-            console.log('Parquet rows:', parsedRows.length);
-            console.log('First parquet row:', parsedRows[0]);
-
-            // Data needed for the Sankey itself with extracted SSP and RCP
-            gcamEnergyData = parsedRows
+            const processedRows = parsedRows
                 .filter(
                     (r) =>
                         r.source &&
@@ -449,8 +514,43 @@
                         ssp: sspMatch ? sspMatch[0].toLowerCase() : null
                     };
                 });
+
+            energyLevelDataCache = {
+                ...energyLevelDataCache,
+                [levelKey]: processedRows
+            };
+
+            return processedRows;
+        })().finally(() => {
+            delete pendingLevelPromises[levelKey];
+        });
+
+        return pendingLevelPromises[levelKey];
+    }
+
+    async function loadGcamEnergyForDetailLevel(detailLevel) {
+        const requiredLevels = ['0', String(detailLevel)];
+        const needsFetch = !energyNodeTable || requiredLevels.some(lvl => !energyLevelDataCache[lvl]);
+
+        if (needsFetch) {
+            isLoadingEnergyData = true;
+        }
+
+        try {
+            await Promise.all([
+                ...requiredLevels.map(lvl => loadParquetLevel(lvl)),
+                energyNodeTable
+                    ? null
+                    : fetchParquet('gcam_usa_energy_nodes.parquet').then(rows => { energyNodeTable = buildNodeTable(rows); })
+            ]);
+
+            // Merge level 0 plus the active detail level
+            const l0Rows = energyLevelDataCache['0'] || [];
+            const detailRows = energyLevelDataCache[String(detailLevel)] || [];
+            gcamEnergyData = [...l0Rows, ...detailRows];
+            loadedDetailLevel = String(detailLevel);
         } catch (error) {
-            console.error('Error loading gcam_usa_energy.parquet:', error);
+            console.error('Error loading split GCAM energy parquet files:', error);
         } finally {
             isLoadingEnergyData = false;
         }
@@ -478,6 +578,9 @@
         const detailName = (detailLevels.find(d => d.value === currentDetailLevel) || {}).label || currentDetailLevel;
 
         const layout = {
+            autosize: true,
+            height: PLOT_HEIGHT_PX + 220,
+            margin: { t: 100, b: 120, l: 20, r: 20 },
             title: selectedDiagram === 'Energy' 
                 ? `Energy Sankey Diagram for ${currentSelectedStates.length === 1 ? currentSelectedStates[0] : 'Selected Region'}` 
                 : `${diagramMapping[selectedDiagram]} Sankey Diagram for the United States`,
@@ -486,33 +589,60 @@
                 steps: frames.map(frame => ({
                     method: "animate",
                     label: frame.name,
-                    args: [[frame.name], { mode: "next", frame: { duration: 2000, redraw: true }, transition: { duration: 2000 , easing: "cubic-in-out"} }]
+                    args: [[frame.name], {
+                        mode: "next",
+                        frame: { duration: 2000, redraw: true },
+                        transition: {
+                            duration: 2000,
+                            easing: "cubic-in-out"
+                        }
+                    }]
                 })),
                 active: activeIndex,
+
+                // Place the bar in the lower margin.
+                x: 0.17,
+                xanchor: "left",
+                len: 0.80,
+                y: -0.14,
+                yanchor: "top",
+
                 currentvalue: {
                     prefix: "Year: ",
                     font: { size: 16, color: "#666" }
                 },
-                pad: { t: 10 }
+                pad: { t: 0, b: 0 }
             }],
             updatemenus: [{
                 type: "buttons",
                 showactive: false,
+                direction: "right",
+                x: 0.00,
+                xanchor: "left",
+                y: -0.14,
+                yanchor: "top",
+                pad: { t: 0, r: 8 },
                 buttons: [
                     {
                         label: "Play",
                         method: "animate",
-                        args: [null, { frame: { duration: 2000, redraw: true }, fromcurrent: true, mode: "next", transition: { duration: 1000 } }]
+                        args: [null, {
+                            frame: { duration: 2000, redraw: true },
+                            fromcurrent: true,
+                            mode: "next",
+                            transition: { duration: 1000 }
+                        }]
                     },
                     {
                         label: "Pause",
                         method: "animate",
-                        args: [[null], { mode: "immediate", frame: { duration: 0, redraw: false }, transition: { duration: 0 } }]
+                        args: [[null], {
+                            mode: "immediate",
+                            frame: { duration: 0, redraw: false },
+                            transition: { duration: 0 }
+                        }]
                     }
-                ],
-                x: 0,
-                y: 0, 
-                pad: {t: 10, r: 10}
+                ]
             }],
             annotations: [
                 {
@@ -537,7 +667,7 @@
         const targetElement = document.getElementById("hybridSankeyDiagram");
         if (!targetElement) return;
 
-        Plotly.react(targetElement, initialFrame.data, layout)
+        Plotly.react(targetElement, initialFrame.data, layout, { responsive: true })
             .then(() => {
                 if (thisRender === renderCounter) {
                     if (targetElement.on && !targetElement._hasSliderChangeListener) {
@@ -548,6 +678,7 @@
                             }
                         });
                     }
+
                     return Plotly.addFrames(targetElement, frames);
                 }
             })
@@ -571,16 +702,56 @@
 
     $: activeData = selectedDiagram === 'Energy' ? gcamEnergyData : energywaterdata;
 
-    $: if (selectedDiagram === 'Energy' && !gcamEnergyData && !isLoadingEnergyData) {
-        loadGcamEnergyData();
+    $: if (selectedDiagram === 'Energy') {
+        const hasL0 = Boolean(energyLevelDataCache['0']);
+        const hasDetail = Boolean(energyLevelDataCache[String(selectedDetailLevel)]);
+        const hasNodeTable = Boolean(energyNodeTable);
+
+        if (!hasL0 || !hasDetail || !hasNodeTable) {
+            loadGcamEnergyForDetailLevel(selectedDetailLevel);
+        } else if (gcamEnergyData !== undefined && loadedDetailLevel !== String(selectedDetailLevel)) {
+            const l0Rows = energyLevelDataCache['0'] || [];
+            const detailRows = energyLevelDataCache[String(selectedDetailLevel)] || [];
+
+            gcamEnergyData = [...l0Rows, ...detailRows];
+            loadedDetailLevel = String(selectedDetailLevel);
+        }
     }
 
-    $: if (activeData && (
-        selectedDiagram === 'Energy'
-            ? (selectedStates.length > 0 && selectedSSP && selectedRCP && selectedDetailLevel)
-            : (selectedSSP && selectedRCP && selectedClimate && selectedDiagram && selectedEnergyUnits && selectedWaterUnits)
-    )) {
-        initializeHybridSankey(activeData, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel, selectedColorPalette);
+    $: if (
+        activeData &&
+        (
+            selectedDiagram === 'Energy'
+                ? (
+                    energyNodeTable &&
+                    selectedStates.length > 0 &&
+                    selectedSSP &&
+                    selectedRCP &&
+                    selectedDetailLevel &&
+                    loadedDetailLevel === String(selectedDetailLevel)
+                )
+                : (
+                    selectedSSP &&
+                    selectedRCP &&
+                    selectedClimate &&
+                    selectedDiagram &&
+                    selectedEnergyUnits &&
+                    selectedWaterUnits
+                )
+        )
+    ) {
+        initializeHybridSankey(
+            activeData,
+            selectedSSP,
+            selectedRCP,
+            selectedClimate,
+            selectedDiagram,
+            selectedEnergyUnits,
+            selectedWaterUnits,
+            selectedStates,
+            selectedDetailLevel,
+            selectedColorPalette
+        );
     }
 
     function downloadCSV(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel) {
@@ -837,7 +1008,12 @@
             </fieldset>
         </div>
 
-        <div class="pt-8">
+        <div class="pt-6 flex flex-col gap-3">
+            <button on:click={resetLayout} type="button" class="bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-300 font-semibold py-2 px-4 rounded inline-flex items-center justify-center">
+                <Icon icon="tabler:restore" class="mr-2 text-lg" />
+                <span>Reset Layout</span>
+            </button>
+
             <button on:click={() => downloadCSV(activeData, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel)} class="bg-gray-200 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded inline-flex items-center">
                 <svg class="fill-current w-4 h-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M13 8V2H7v6H2l8 8 8-8h-5zM0 18h20v2H0v-2z"/></svg>
                 <span>Download Selected Data</span>
@@ -849,12 +1025,22 @@
 
     <!-- Sankey placement -->
     <div id="sankeyWrapper" class="h-full w-full min-h-[800px] flex flex-col items-stretch flex-1 m-0 p-0">
-        {#if isLoadingEnergyData}
+        {#if layoutErrorMessage}
+            <div class="m-8 p-6 bg-red-50 border border-red-300 rounded-lg text-red-800">
+                <h3 class="text-lg font-bold mb-2">Layout Configuration Error</h3>
+                <p class="mb-4">The selected filters produced conflicting semantic layout constraints:</p>
+                <pre class="bg-white p-3 border border-red-200 rounded text-xs overflow-x-auto whitespace-pre-wrap">{layoutErrorMessage}</pre>
+                <button on:click={resetLayout} class="mt-4 px-4 py-2 bg-red-600 text-white rounded font-medium hover:bg-red-700">
+                    Retry Default Layout
+                </button>
+            </div>
+        {:else if isLoadingEnergyData}
             <div class="flex items-center justify-center min-h-[800px]">
                 <p class="text-xl text-gray-600">Loading Energy data...</p>
             </div>
         {/if}
-        <div id="hybridSankeyDiagram" class="w-full min-h-[800px] m-0 p-0" class:hidden={isLoadingEnergyData}></div> 
-    </div>
+        <div id="hybridSankeyDiagram"
+     class="w-full min-h-[800px] m-0 p-0"
+     class:invisible={isLoadingEnergyData || layoutErrorMessage}></div>    </div>
 
 </div>
