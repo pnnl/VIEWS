@@ -250,6 +250,12 @@
     }
 
     function getLinkColor(row, palette) {
+        // Any flow ending in losses uses the losses gray, regardless of palette.
+        // (energy-water already handles this via getEnergyWaterFlowType.)
+        if (palette !== 'energy-water' && isLossNode(row.target)) {
+            return colorWithAlpha(energyWaterPalette.losses, 0.35);
+        }
+
         switch (palette) {
             case 'energy-water':
                 return energyWaterPalette[getEnergyWaterFlowType(row)];
