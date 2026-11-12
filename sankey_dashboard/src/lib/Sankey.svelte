@@ -4,6 +4,7 @@
     import { onMount } from 'svelte';
     import { base } from '$app/paths';
     import Icon from "@iconify/svelte";
+    import { slide } from 'svelte/transition';
     import { computeNodePositions } from './sankeyLayout.js';
     import { computeEnergyLayout } from './energyLayout.js';
     import { buildNodeTable } from './tableLayout.js';
@@ -119,6 +120,18 @@
     };
 
     let selectedColorPalette = 'energy-water';
+
+    // Collapsible Visualization Options sections (collapsed by default)
+    let expandedSections = { palette: false, flows: false, waterUnits: false, energyUnits: false };
+    function toggleSection(key) {
+        expandedSections = { ...expandedSections, [key]: !expandedSections[key] };
+    }
+
+    // Current-choice summaries shown in collapsed headers
+    $: paletteLabel = colorPalettes.find(p => p.value === selectedColorPalette)?.label ?? '';
+    $: diagramLabel = selectedDiagram;
+    $: waterUnitLabel = waterUnitMapping[selectedWaterUnits];
+    $: energyUnitLabel = energyUnitMapping[selectedEnergyUnits];
 
     function normalizeLabel(value) {
         return String(value ?? '').trim().toLowerCase();
@@ -977,18 +990,26 @@
         Visualization Options
         </h5>
     </div>
-    <nav class="flex flex-col gap-2 px-3 pb-4 font-sans text-base font-normal text-blue-gray-700">
-        <div role="contentinfo"
-        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
+    <nav class="flex min-w-[240px] flex-col font-sans text-base font-normal text-blue-gray-700">
+        <button type="button"
+        on:click={() => toggleSection('palette')}
+        aria-expanded={expandedSections.palette}
+        aria-controls="section-palette"
+        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start cursor-pointer hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
             <div class="grid mr-4 place-items-center">
                 <Icon icon="tabler:palette" style="font-size: 25px" />
             </div>
-            <div class="group flex relative">
-                <span>Color Palette:</span> 
+            <div class="flex flex-col items-start flex-1 min-w-0">
+                <span>Color Palette</span>
+                {#if !expandedSections.palette}
+                    <span class="text-xs text-gray-500 truncate">{paletteLabel}</span>
+                {/if}
             </div>
-        </div>
-        <div class="flex leading-normal m-8 pl-7 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
-            <fieldset class="flex flex-col gap-2 pt-1 text-sm text-gray-800">
+            <Icon icon={expandedSections.palette ? 'tabler:chevron-up' : 'tabler:chevron-down'} class="ml-auto text-lg" />
+        </button>
+        {#if expandedSections.palette}
+        <div id="section-palette" transition:slide={{ duration: 200 }} class="flex leading-normal ml-8 pl-7 pb-2 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+            <fieldset class="flex flex-col gap-2 text-gray-800">
                 {#each colorPalettes as palette}
                     <div class="flex items-center gap-2">
                         <input
@@ -1003,22 +1024,31 @@
                 {/each}
             </fieldset>
         </div>
+        {/if}
     </nav>
 
     <nav class="flex min-w-[240px] flex-col font-sans text-base font-normal text-blue-gray-700">
-        <div role="contentinfo"
-        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
+        <button type="button"
+        on:click={() => toggleSection('flows')}
+        aria-expanded={expandedSections.flows}
+        aria-controls="section-flows"
+        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start cursor-pointer hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
             <div class="grid mr-4 place-items-center">
                 <Icon icon="tabler:mist" style="font-size: 25px" />
             </div>
-            <div class="group flex relative">
-                <span>Show flows for:</span> 
+            <div class="flex flex-col items-start flex-1 min-w-0">
+                <span>Show flows for</span>
+                {#if !expandedSections.flows}
+                    <span class="text-xs text-gray-500 truncate">{diagramLabel}</span>
+                {/if}
             </div>
-        </div>
+            <Icon icon={expandedSections.flows ? 'tabler:chevron-up' : 'tabler:chevron-down'} class="ml-auto text-lg" />
+        </button>
 
-        <div class="flex leading-normal m-8 pl-7 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+        {#if expandedSections.flows}
+        <div id="section-flows" transition:slide={{ duration: 200 }} class="flex leading-normal ml-8 pl-7 pb-2 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
             <fieldset>
-                <div class="flex flex-col top-15 gap-2">
+                <div class="flex flex-col gap-2">
                 {#each diagrams as s}
                 <div>
                     <input type="radio" id={s} name="diagram" value={s} bind:group={selectedDiagram}/>
@@ -1028,22 +1058,31 @@
                 </div>
             </fieldset>
         </div>
+        {/if}
     </nav>
 
     <nav class="flex min-w-[240px] flex-col font-sans text-base font-normal text-blue-gray-700">
-        <div role="contentinfo"
-        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
+        <button type="button"
+        on:click={() => toggleSection('waterUnits')}
+        aria-expanded={expandedSections.waterUnits}
+        aria-controls="section-waterUnits"
+        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start cursor-pointer hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
             <div class="grid mr-4 place-items-center">
                 <Icon icon="lets-icons:water" style="font-size: 25px" />
             </div>
-            <div class="group flex relative">
-                <span>Select Water Units:</span> 
+            <div class="flex flex-col items-start flex-1 min-w-0">
+                <span>Select Water Units</span>
+                {#if !expandedSections.waterUnits}
+                    <span class="text-xs text-gray-500 truncate">{waterUnitLabel}</span>
+                {/if}
             </div>
-        </div>
+            <Icon icon={expandedSections.waterUnits ? 'tabler:chevron-up' : 'tabler:chevron-down'} class="ml-auto text-lg" />
+        </button>
 
-        <div class="flex leading-normal m-8 pl-7 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+        {#if expandedSections.waterUnits}
+        <div id="section-waterUnits" transition:slide={{ duration: 200 }} class="flex leading-normal ml-8 pl-7 pb-2 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
             <fieldset>
-                <div class="flex flex-col top-15 gap-2">
+                <div class="flex flex-col gap-2">
                 {#each water_units as s}
                 <div>
                     <input type="radio" id={s} name="waterUnits" value={s} bind:group={selectedWaterUnits}/>
@@ -1053,22 +1092,31 @@
                 </div>
             </fieldset>
         </div>
+        {/if}
     </nav>
     
     <nav class="flex min-w-[240px] flex-col font-sans text-base font-normal text-blue-gray-700">
-        <div role="contentinfo"
-        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
+        <button type="button"
+        on:click={() => toggleSection('energyUnits')}
+        aria-expanded={expandedSections.energyUnits}
+        aria-controls="section-energyUnits"
+        class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start cursor-pointer hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
             <div class="grid mr-4 place-items-center">
                 <Icon icon="nimbus:fire" style="font-size: 25px" />
             </div>
-            <div class="group flex relative">
-                <span>Select Energy Units:</span> 
+            <div class="flex flex-col items-start flex-1 min-w-0">
+                <span>Select Energy Units</span>
+                {#if !expandedSections.energyUnits}
+                    <span class="text-xs text-gray-500 truncate">{energyUnitLabel}</span>
+                {/if}
             </div>
-        </div>
+            <Icon icon={expandedSections.energyUnits ? 'tabler:chevron-up' : 'tabler:chevron-down'} class="ml-auto text-lg" />
+        </button>
 
-        <div class="flex leading-normal m-8 pl-7 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+        {#if expandedSections.energyUnits}
+        <div id="section-energyUnits" transition:slide={{ duration: 200 }} class="flex leading-normal ml-8 pl-7 pb-2 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
             <fieldset>
-                <div class="flex flex-col top-15 gap-2">
+                <div class="flex flex-col gap-2">
                 {#each energy_units as s}
                 <div>
                     <input type="radio" id={s} name="energyUnits" value={s} bind:group={selectedEnergyUnits}/>
@@ -1078,6 +1126,7 @@
                 </div>
             </fieldset>
         </div>
+        {/if}
 
         <div class="pt-6 flex flex-col gap-3">
             <button on:click={resetLayout} type="button" class="bg-blue-50 hover:bg-blue-100 text-blue-700 border border-blue-300 font-semibold py-2 px-4 rounded inline-flex items-center justify-center">
