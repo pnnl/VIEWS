@@ -570,7 +570,8 @@
                         r.target &&
                         r.year != null &&
                         r.scenario &&
-                        r.region
+                        r.region &&
+                        String(r.scenario).includes('cooler')
                 )
                 .map((r) => {
                     const rcpMatch = String(r.scenario).match(rcpRegex);
