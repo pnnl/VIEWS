@@ -89,7 +89,7 @@
     let energyLevelDataCache = {};
     let pendingLevelPromises = {};
     let isLoadingEnergyData = false;
-    let selectedStates = ['WA'];
+    let selectedStates = ['CA'];
     let selectedDetailLevel = '1'; // maps to 1, 2, 3 (always includes level 0)
     let renderCounter = 0;
     let currentSelectedYear = null;
@@ -361,7 +361,7 @@
             best = { ...res, padPx };
             if (res.labelsFit) return best;
         }
-        padPx *= 1.25; // larger pad -> smaller nodes -> more room for labels
+        padPx *= 1.5; // larger pad -> smaller nodes -> more room for labels
     }
     if (best) {
         console.warn('Sankey: nodes do not overlap, but some labels may still be too close.');
@@ -643,7 +643,7 @@
         const detailName = (detailLevels.find(d => d.value === currentDetailLevel) || {}).label || currentDetailLevel;
         
         const CONTROLS_Y = -0.01;  // paper units below the plot
-        const MARGIN_B = 60;
+        const MARGIN_B = 70;
 
         const layout = {
             autosize: true,
