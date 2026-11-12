@@ -300,6 +300,32 @@ function findFeedbackEdges(activeLinks) {
     return excludedEdgeKeys;
 }
 
+// Mirrors Plotly/d3-sankey node scaling (acyclic graphs): layer = longest path
+// from sources, sinks justified to last layer, ky = min_layer (1-(n-1)*pad)/sum.
+function plotlyKy(labels, activeLinks, nodeMeta, padFrac) {
+    const out = new Map(labels.map(l => [l, []]));
+    for (const r of activeLinks) if (r.source !== r.target) out.get(r.source)?.push(r.target);
+    const layer = new Map(labels.map(l => [l, 0]));
+    for (let i = 0; i < labels.length; i++) {
+        let changed = false;
+        for (const [u, vs] of out) for (const v of vs) {
+            if (layer.get(v) < layer.get(u) + 1) { layer.set(v, layer.get(u) + 1); changed = true; }
+        }
+        if (!changed) break;
+    }
+    const maxLayer = Math.max(...layer.values());
+    for (const l of labels) if (out.get(l).length === 0) layer.set(l, maxLayer);
+    const totals = new Map(), counts = new Map();
+    for (const l of labels) {
+        const c = layer.get(l);
+        totals.set(c, (totals.get(c) || 0) + nodeMeta.get(l).magnitude);
+        counts.set(c, (counts.get(c) || 0) + 1);
+    }
+    let ky = Infinity;
+    for (const [c, t] of totals) if (t > 0) ky = Math.min(ky, (1 - padFrac * (counts.get(c) - 1)) / t);
+    return Number.isFinite(ky) && ky > 0 ? ky : 0;
+}
+
 /**
  * Compute deterministic x, y node positions and metadata satisfying all layout constraints.
  *
@@ -660,6 +686,9 @@ export function computeLayout(links = [], options = {}) {
         }
     }
     if (!Number.isFinite(ky) || ky < 0) ky = 0;
+    if (options.mirrorPlotlyHeights) {
+        ky = plotlyKy(labels, activeLinks, nodeMeta, padFrac);
+    }
 
     const heightByLabel = new Map();
     for (const l of labels) {
@@ -721,10 +750,24 @@ export function computeLayout(links = [], options = {}) {
 
     // Energy band must fit BOTH the tallest upstream column AND the summed sector bands
     const reqEnergyTotal = Math.max(reqEnergy, reqEndUse);
-    const energyBottom = hasWaterNodes
+    let energyBottom = hasWaterNodes
         ? Math.max(nonLossEnergyTop + reqEnergyTotal, 0.99 - reqWater - bandPad)
         : 0.99;
+    if (options.labelSepFrac && hasWaterNodes && hasEnergyNodes) {
+        const maxCount = pred => Math.max(1, ...colNodeLists.map(col => col.filter(pred).length));
+        const eN = maxCount(l => !nodeMeta.get(l).isWater && !nodeMeta.get(l).isLosses);
+        const wN = maxCount(l => nodeMeta.get(l).isWater);
+        const free = 0.99 - bandPad - nonLossEnergyTop - reqEnergyTotal - reqWater;
+        if (free > 0) energyBottom = nonLossEnergyTop + reqEnergyTotal + free * eN / (eN + wN);
+    }
     const waterRange = hasEnergyNodes ? [energyBottom + bandPad, 0.99] : [0.01, 0.99];
+
+    const requiredSpan = 0.01
+        + (hasLosses ? reqLosses + bandPad : 0)
+        + reqEnergyTotal
+        + (hasWaterNodes && hasEnergyNodes ? bandPad : 0)
+        + (hasWaterNodes ? reqWater : 0);
+    const overflow = options.mirrorPlotlyHeights ? requiredSpan - 0.99 : 0; 
 
     const totalGroupWeight = [...groupWeights.values()].reduce((a, b) => a + b, 0) || 1;
     const availEndUseSpan = Math.max(0.1, (energyBottom - nonLossEnergyTop) - bandGap * Math.max(0, activeEndUseGroups.length - 1));
@@ -856,6 +899,25 @@ export function computeLayout(links = [], options = {}) {
         }
     }
 
+    let labelsFit = true;
+    if (options.labelSepFrac) {
+        const gap = 4 / (options.plotHeightPx ?? 600); // 4px minimum between node edges
+        const byY = (a, b) => yByLabel.get(a) - yByLabel.get(b); // preserves all ordering rules
+        const spread = (nodes, top, bot) => {
+            if (nodes.length === 0) return;
+            const ok = spreadCenters([...nodes].sort(byY), top, bot, yByLabel, heightByLabel, edgeGap, options.labelSepFrac);
+            labelsFit = ok && labelsFit;
+        };
+        const isEndUse = l => nodeMeta.get(l).sector || nodeMeta.get(l).isNetExported;
+        for (let c = 0; c < numCols; c++) {
+            const col = colNodeLists[c];
+            const eNodes = col.filter(l => !nodeMeta.get(l).isWater && !nodeMeta.get(l).isLosses).sort(byY);
+            const wNodes = col.filter(l => nodeMeta.get(l).isWater).sort(byY);
+            labelsFit = spreadCenters(eNodes, nonLossEnergyTop, energyBottom, yByLabel, heightByLabel, gap, options.labelSepFrac) && labelsFit;
+            labelsFit = spreadCenters(wNodes, waterRange[0], waterRange[1], yByLabel, heightByLabel, gap, options.labelSepFrac) && labelsFit;
+        }
+    }
+
     // Apply user perpendicular drag overrides (userYOverrides) if provided, then re-project
     const overrides = options.userYOverrides;
     if (overrides && (overrides instanceof Map ? overrides.size > 0 : Object.keys(overrides).length > 0)) {
@@ -913,7 +975,9 @@ export function computeLayout(links = [], options = {}) {
         heights,
         nodeMeta,
         excludedEdgeKeys,
-        placement // Map(label -> {col, order}) when table-driven, else null
+        placement, // Map(label -> {col, order}) when table-driven, else null
+        overflow,
+        labelsFit
     };
 
     const validation = validateLayout(result, activeLinks, options);
@@ -927,27 +991,76 @@ export function computeLayout(links = [], options = {}) {
     return result;
 }
 
-function projectNonOverlapping(orderedNodes, minBound, maxBound, yMap, hMap) {
+/**
+ * Make an ordered column of nodes non-overlapping inside [minBound, maxBound]
+ * (center-based y). Works on the whole column at once:
+ *   1. top-down pass: push each node below its predecessor (+gap), starting at minBound;
+ *   2. bottom-up pass: from maxBound, pull each node above its successor (-gap).
+ * Pass 2 moves whole runs together, so nodes never stack on the top edge.
+ * If the column cannot fit with the full gap, the gap is reduced evenly.
+ * @returns {number} the gap actually used
+ */
+export function projectNonOverlapping(orderedNodes, minBound, maxBound, yMap, hMap, gap = 0) {
     const n = orderedNodes.length;
-    if (n <= 1) return;
-    const minGap = 0.004;
-    for (let i = 1; i < n; i++) {
-        const prev = orderedNodes[i - 1];
-        const curr = orderedNodes[i];
-        const reqDiff = (hMap.get(prev) + hMap.get(curr)) / 2 + minGap;
-        if (yMap.get(curr) < yMap.get(prev) + reqDiff) {
-            yMap.set(curr, yMap.get(prev) + reqDiff);
-        }
+    if (n === 0) return gap;
+    const h = u => hMap.get(u) || 0;
+    const total = orderedNodes.reduce((a, u) => a + h(u), 0);
+    const room = maxBound - minBound - total;
+    const g = n > 1 ? Math.max(0, Math.min(gap, room / (n - 1))) : 0;
+
+    // 1. Downward pass
+    let floor = minBound;
+    for (const u of orderedNodes) {
+        const y = Math.max(yMap.get(u) ?? -Infinity, floor + h(u) / 2);
+        yMap.set(u, y);
+        floor = y + h(u) / 2 + g;
     }
-    const last = orderedNodes[n - 1];
-    const overflow = (yMap.get(last) + hMap.get(last) / 2) - maxBound;
-    if (overflow > 0) {
-        // Shift back or re-pack within [minBound, maxBound]
-        for (let i = n - 1; i >= 0; i--) {
-            const u = orderedNodes[i];
-            yMap.set(u, Math.max(minBound + hMap.get(u) / 2, yMap.get(u) - overflow));
-        }
+    // 2. Upward pass from the bottom edge
+    let ceil = maxBound;
+    for (let i = n - 1; i >= 0; i--) {
+        const u = orderedNodes[i];
+        const y = Math.min(yMap.get(u), ceil - h(u) / 2);
+        yMap.set(u, y);
+        ceil = y - h(u) / 2 - g;
     }
+    return g;
+}
+
+/**
+ * Spread one column's nodes (centre-based y) inside [top, bottom] so that
+ * neighbouring centres are at least max(edge clearance, labelSep) apart,
+ * using the column's spare space. Order is preserved.
+ * @returns {boolean} true if label spacing fits; false = fell back to edge-only.
+ */
+export function spreadCenters(ordered, top, bottom, yMap, hMap, gap, labelSep) {
+    const n = ordered.length;
+    if (n === 0) return true;
+    const h = u => hMap.get(u) || 0;
+    const edgeSep = i => (h(ordered[i]) + h(ordered[i + 1])) / 2 + gap;
+    const need = s => {
+        let t = h(ordered[0]) / 2 + h(ordered[n - 1]) / 2;
+        for (let i = 0; i < n - 1; i++) t += s(i);
+        return t;
+    };
+    let sep = i => Math.max(edgeSep(i), labelSep);
+    let fits = need(sep) <= bottom - top + 1e-9;
+    if (!fits) sep = i => (h(ordered[i]) + h(ordered[i + 1])) / 2; // overlap-free only
+
+    // Push down from the top, then pull up from the bottom.
+    let prev = null;
+    ordered.forEach((u, i) => {
+        const lo = i === 0 ? top + h(u) / 2 : prev + sep(i - 1);
+        prev = Math.max(yMap.get(u) ?? lo, lo);
+        yMap.set(u, prev);
+    });
+    let next = null;
+    for (let i = n - 1; i >= 0; i--) {
+        const u = ordered[i];
+        const hi = i === n - 1 ? bottom - h(u) / 2 : next - sep(i);
+        next = Math.min(yMap.get(u), hi);
+        yMap.set(u, next);
+    }
+    return fits;
 }
 
 /**

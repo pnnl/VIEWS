@@ -27,7 +27,9 @@
     // This is the actual Sankey trace height used by the layout solver.
     // Controls are placed in Plotly's bottom margin, not inside this area.
     const PLOT_HEIGHT_PX = 600;
-    const NODE_PAD_PX = 18;
+    const NODE_PAD_PX = 10;        
+    const WATER_NODE_PAD_PX = 30;  
+    const LABEL_LINE_PX = 20;      
 
     async function fetchParquet(fileName) {
         const response = await fetch(`${base}/${fileName}`);
@@ -101,12 +103,12 @@
             label: 'Simple'
         },
         {
-            value: 'interpolated',
-            label: 'Interpolated'
+            value: 'data',
+            label: 'By Energy Type'
         },
         {
-            value: 'source',
-            label: 'By Source'
+            value: 'interpolated',
+            label: 'Interpolated'
         }
     ];
     const energyWaterPalette = {
@@ -260,8 +262,13 @@
             case 'energy-water':
                 return energyWaterPalette[getEnergyWaterFlowType(row)];
 
-            case 'source':
-                return colorWithAlpha(row.source_color, 0.35);
+            case 'data':
+                // Edge color straight from the parquet (keyed by originating fuel).
+                if (row.link_color) {
+                    return colorWithAlpha(row.link_color, 0.35);
+                }
+                // No parquet edge color (e.g. non-Energy diagrams): fall back to interpolated.
+                // falls through
 
             case 'interpolated':
             default:
@@ -327,6 +334,30 @@
         }
     }
 
+    function computeWaterFrameLayout(frameLabels, yearData) {
+    let padPx = WATER_NODE_PAD_PX, res, best = null;
+    for (let attempt = 0; attempt < 8; attempt++) {
+        res = computeNodePositions(frameLabels, yearData, {
+            strict: false,
+            mirrorPlotlyHeights: true,
+            padPx,
+            plotHeightPx: PLOT_HEIGHT_PX,
+            labelSepFrac: LABEL_LINE_PX / PLOT_HEIGHT_PX
+        });
+        if (res.overflow <= 0 && res.validation.valid) {
+            best = { ...res, padPx };
+            if (res.labelsFit) return best;
+        }
+        padPx *= 1.25; // larger pad -> smaller nodes -> more room for labels
+    }
+    if (best) {
+        console.warn('Sankey: nodes do not overlap, but some labels may still be too close.');
+        return best;
+    }
+    const msg = res.validation.violations.map(v => `${v.rule}: ${v.message}`).join('; ');
+    throw new Error(`Layout could not be made overlap-free: ${msg || 'band overflow'}`);
+}
+
     // Generate Sankey frames by year and scenario
     function generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
         let filteredData;
@@ -340,10 +371,14 @@
             );
 
             // Sum flows across multiple selected states.
-            // Node colors come from the nodes parquet, not the edge rows.
+            // Node colors come from the nodes parquet. In 'data' mode, edges are
+            // additionally split by their parquet color so each fuel keeps its own band.
+            const splitByColor = selectedColorPalette === 'data';
             const aggregatedMap = new Map();
             matchingRows.forEach(row => {
-                const key = `${row.year}|||${row.source}|||${row.target}`;
+                const key = splitByColor
+                    ? `${row.year}|||${row.source}|||${row.target}|||${row.color}`
+                    : `${row.year}|||${row.source}|||${row.target}`;
                 const val = parseFloat(row.value) || 0;
                 if (!aggregatedMap.has(key)) {
                     aggregatedMap.set(key, {
@@ -352,6 +387,8 @@
                         target: row.target,
                         source_color: energyNodeTable?.get(row.source)?.color ?? null,
                         target_color: energyNodeTable?.get(row.target)?.color ?? null,
+                        link_color: splitByColor ? (row.color ?? null) : null,
+                        source_key: splitByColor ? (row.source_key ?? null) : null,
                         source_position: row.source_position,
                         target_position: row.target_position,
                         value: val,
@@ -388,7 +425,7 @@
                 ? computeEnergyLayout([...labels], filteredData, energyNodeTable, currentDetailLevel,
                     { padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX })
                 : computeNodePositions([...labels], filteredData,
-                    { strict: true, padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX });
+                    { strict: false, padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX });
             layoutWarnings = layoutRes.warnings ?? [];
             labelsArray = layoutRes.labels; // Use the canonical deterministically sorted label order!
             nodeX = layoutRes.x;
@@ -415,6 +452,12 @@
             const used = new Set(yearData.flatMap(row => [row.source, row.target]));
             const frameLabels = labelsArray.filter(l => used.has(l));
             const idx = new Map(frameLabels.map((l, i) => [l, i]));
+            const frameLayout = selectedDiagram !== 'Energy'
+                ? computeWaterFrameLayout(frameLabels, yearData)
+                : null;
+            const frameXY = frameLayout
+                ? new Map(frameLayout.labels.map((l, i) => [l, { x: frameLayout.x[i], y: frameLayout.y[i] }]))
+                : null;
 
             const sources = [];
             const targets = [];
@@ -434,11 +477,12 @@
                 targets.push(tIdx);
                 values.push(parseFloat(row.value));
                 linkColors.push(getLinkColor(row, selectedColorPalette));
-                if (selectedColorPalette !== 'energy-water') {
+                if (selectedColorPalette === 'interpolated' ||
+                    (selectedColorPalette === 'data' && selectedDiagram !== 'Energy')) {
                     if (row.source_color) nodeColors[sIdx] = row.source_color;
                     if (row.target_color) nodeColors[tIdx] = row.target_color;
                 }
-                flowHoverLabels.push(parseFloat(row.unit_value ?? row.value));
+                flowHoverLabels.push([parseFloat(row.unit_value ?? row.value), row.source_key ?? '']);
             });
 
             frames.push({
@@ -449,14 +493,14 @@
                     valueformat: '.3r',
                     orientation: "h",
                     node: {
-                        pad: NODE_PAD_PX,
+                        pad: frameLayout ? frameLayout.padPx : NODE_PAD_PX,
                         thickness: 20,
                         line: { color: "black", width: 0.5 },
                         label: frameLabels,
                         hoverinfo: "none",
                         color: nodeColors,
-                        x: frameLabels.map(l => pos.get(l).x),
-                        y: frameLabels.map(l => pos.get(l).y)
+                        x: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).x),
+                        y: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).y)
                     },
                     link: {
                         source: sources,
@@ -464,7 +508,9 @@
                         value: values,
                         color: linkColors,
                         customdata: flowHoverLabels,
-                        hovertemplate: "Source: %{source.label}<br>Target: %{customdata}<extra></extra>"
+                        hovertemplate: selectedColorPalette === 'data'
+                            ? "Source: %{source.label}<br>Fuel: %{customdata[1]}<br>Target: %{customdata[0]}<extra></extra>"
+                            : "Source: %{source.label}<br>Target: %{customdata[0]}<extra></extra>"
                     }
                 }]
             });
@@ -582,11 +628,14 @@
             : `${currentSelectedStates.length} Selected States (${currentSelectedStates.join(', ')})`;
 
         const detailName = (detailLevels.find(d => d.value === currentDetailLevel) || {}).label || currentDetailLevel;
+        
+        const CONTROLS_Y = -0.01;  // paper units below the plot
+        const MARGIN_B = 60;
 
         const layout = {
             autosize: true,
-            height: PLOT_HEIGHT_PX + 220,
-            margin: { t: 100, b: 120, l: 20, r: 20 },
+            height: PLOT_HEIGHT_PX + 100 + MARGIN_B,
+            margin: { t: 100, b: MARGIN_B, l: 20, r: 20 },
             title: selectedDiagram === 'Energy' 
                 ? `Energy Sankey Diagram for ${currentSelectedStates.length === 1 ? currentSelectedStates[0] : 'Selected Region'}` 
                 : `${diagramMapping[selectedDiagram]} Sankey Diagram for the United States`,
@@ -597,9 +646,9 @@
                     label: frame.name,
                     args: [[frame.name], {
                         mode: "next",
-                        frame: { duration: 2000, redraw: true },
+                        frame: { duration: 1200, redraw: true },
                         transition: {
-                            duration: 2000,
+                            duration: 600,
                             easing: "cubic-in-out"
                         }
                     }]
@@ -607,10 +656,10 @@
                 active: activeIndex,
 
                 // Place the bar in the lower margin.
-                x: 0.17,
+                x: 0.1,
                 xanchor: "left",
-                len: 0.80,
-                y: -0.14,
+                len: .85,
+                y: CONTROLS_Y,
                 yanchor: "top",
 
                 currentvalue: {
@@ -621,34 +670,30 @@
             }],
             updatemenus: [{
                 type: "buttons",
-                showactive: false,
+                active: -1,              // start paused, so the first click plays
                 direction: "right",
-                x: 0.00,
-                xanchor: "left",
-                y: -0.14,
+                x: 0.07,
+                xanchor: "right",
+                y: CONTROLS_Y - .05,
                 yanchor: "top",
-                pad: { t: 0, r: 8 },
-                buttons: [
-                    {
-                        label: "Play",
-                        method: "animate",
-                        args: [null, {
-                            frame: { duration: 2000, redraw: true },
-                            fromcurrent: true,
-                            mode: "next",
-                            transition: { duration: 1000 }
-                        }]
-                    },
-                    {
-                        label: "Pause",
-                        method: "animate",
-                        args: [[null], {
-                            mode: "immediate",
-                            frame: { duration: 0, redraw: false },
-                            transition: { duration: 0 }
-                        }]
-                    }
-                ]
+                pad: { t: 0, r: 6 },
+                buttons: [{
+                    label: "▶ / ❚❚",
+                    method: "animate",
+                    // 1st click: play
+                    args: [null, {
+                        frame: { duration: 1200, redraw: true },
+                        fromcurrent: true,
+                        mode: "next",
+                        transition: { duration: 600 }
+                    }],
+                    // 2nd click: pause
+                    args2: [[null], {
+                        mode: "immediate",
+                        frame: { duration: 0, redraw: false },
+                        transition: { duration: 0 }
+                    }]
+                }]
             }],
             annotations: [
                 {
@@ -682,6 +727,26 @@
                             if (e && e.step && e.step.label != null) {
                                 currentSelectedYear = e.step.label;
                             }
+                        });
+                    }
+
+                    if (targetElement.on && !targetElement._hasPlayToggleListener) {
+                        targetElement._hasPlayToggleListener = true;
+
+                        // Animation finished (last year played, or slider jump): reset toggle to "paused"
+                        targetElement.on('plotly_animated', () => {
+                            Plotly.relayout(targetElement, {
+                                'updatemenus[0].active': -1,
+                                'updatemenus[0].buttons[0].label': '▶ Play'   // optional
+                            });
+                        });
+
+                        // Optional: switch the label when the button is clicked
+                        targetElement.on('plotly_buttonclicked', () => {
+                            const playing = targetElement.layout.updatemenus[0].active === 0;
+                            Plotly.relayout(targetElement, {
+                                'updatemenus[0].buttons[0].label': playing ? '❚❚ Pause' : '▶ Play'
+                            });
                         });
                     }
 
