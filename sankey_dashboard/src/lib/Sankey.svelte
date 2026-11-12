@@ -55,14 +55,14 @@
 
     // 8 rows x 12 columns US cartogram layout
     const stateGrid = [
-        ['AK', null, null, null, null, null, null, null, null, null, null, 'ME'],
-        [null, null, null, null, null, 'WI', null, null, null, null, 'VT', 'NH'],
-        ['WA', 'ID', 'MT', 'ND', 'MN', 'IL', 'MI', null, 'NY', 'MA', null, null],
-        ['OR', 'NV', 'WY', 'SD', 'IA', 'IN', 'OH', 'PA', 'NJ', 'CT', 'RI', null],
-        ['CA', 'UT', 'CO', 'NE', 'MO', 'KY', 'WV', 'VA', 'MD', 'DE', null, null],
-        [null, 'AZ', 'NM', 'KS', 'AR', 'TN', 'NC', 'SC', 'DC', null, null, null],
-        [null, null, null, 'OK', 'LA', 'MS', 'AL', 'GA', null, null, null, null],
-        ['HI', null, null, 'TX', null, null, null, 'FL', null, null, null, null]
+        ['AK', null, null, null, null, null, null, null, null, null, 'ME'],
+        [null, null, null, null, null, 'WI', null, null, null, 'VT', 'NH'],
+        ['WA', 'ID', 'MT', 'ND', 'MN', 'IL', 'MI', null, 'NY', 'MA', null],
+        ['OR', 'NV', 'WY', 'SD', 'IA', 'IN', 'OH', 'PA', 'NJ', 'CT', 'RI'],
+        ['CA', 'UT', 'CO', 'NE', 'MO', 'KY', 'WV', 'VA', 'MD', 'DE', null],
+        [null, 'AZ', 'NM', 'KS', 'AR', 'TN', 'NC', 'SC', 'DC', null, null],
+        [null, null, null, 'OK', 'LA', 'MS', 'AL', 'GA', null, null, null],
+        ['HI', null, null, 'TX', null, null, null, null, 'FL', null, null]
     ];
 
     const ssps = ['ssp3', 'ssp5']; // backend identifiers 
@@ -905,7 +905,7 @@
             </div>
 
             <!-- United States map click-box grid -->
-            <div class="grid grid-cols-12 gap-1 p-2 bg-gray-50 border border-gray-200 rounded-lg select-none">
+            <div class="grid grid-cols-11 gap-1 p-2 bg-gray-50 border border-gray-200 rounded-lg select-none">
                 {#each stateGrid as row}
                     {#each row as cell}
                         {#if cell}
