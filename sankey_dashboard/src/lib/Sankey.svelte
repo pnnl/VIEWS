@@ -9,8 +9,10 @@
     import { computeEnergyLayout } from './energyLayout.js';
     import { buildNodeTable } from './tableLayout.js';
 
-    const sspMapping = { 'ssp3': 'Low', 'ssp5': 'High', };
-    const rcpMapping = { 'rcp45': 'Low', 'rcp85': 'High',};
+    const sspMapping = { 'ssp3': 'Low', 'ssp5': 'High' };
+    const rcpMapping = { 'rcp45': 'Moderately hotter and drier', 'rcp85': 'Severely hotter and drier' };
+    const sspShortName = { 'ssp3': 'LowPopGDP', 'ssp5': 'HighPopGDP' };
+    const rcpShortName = { 'rcp45': 'ModHotDry', 'rcp85': 'SevHotDry' };
     const climateMapping = { 'cooler': 'Cooler', 'hotter': 'Hotter', };
     const diagramMapping = {'Energy & Water': 'Integrated Energy & Water', 'Energy': 'Energy', 'Water': 'Water'};
     const waterUnitMapping = {'km3': 'Cubic Kilometers', 'billion_gallons': 'Billion Gallons', 'million_acre_ft': 'Million Acre-Feet'};
@@ -711,8 +713,8 @@
             annotations: [
                 {
                     text: selectedDiagram === 'Energy'
-                        ? `${rcpMapping[selectedRCP]} Fossil-fuel Emphasis & ${sspMapping[selectedSSP]} Population and Economic Growth Scenario | States: ${stateLabel} | Level of Detail: ${detailName}`
-                        : `${rcpMapping[selectedRCP]} Fossil-fuel Emphasis & ${sspMapping[selectedSSP]} Population and Economic Growth Scenario`,
+                        ? `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]} | States: ${stateLabel} | Level of Detail: ${detailName}`
+                        : `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]}`,
                     x: 0.5,
                     y: 1.05,
                     xref: "paper",
@@ -852,17 +854,19 @@
                 row.rcp === selectedRCP &&
                 (String(row.level) === '0' || String(row.level) === '0.0' || String(row.level) === String(currentDetailLevel))
             );
-            columnsToDownload = ["scenario", "region", "year", "source", "target", "level", "units", "diagram", "value"];
+            columnsToDownload = ["rcp", "ssp", "region", "year", "source", "target", "level", "units", "diagram", "value"];
         } else {
             const selectedUnitsList = [selectedEnergyUnits, selectedWaterUnits];
             filteredData = data.filter(row => (row.ssp === selectedSSP) && (row.rcp === selectedRCP) && (row.climate_sensitivity === selectedClimate) && (row.diagram === selectedDiagram) && (selectedUnitsList.includes(row.units)));
             columnsToDownload = ["rcp", 'ssp', "source", "target", "year", "unit_value", "units", "diagram"];
         }
 
+        const columnNames = { rcp: 'future_weather', ssp: 'population_gdp_growth' };
+        const valueMaps = { rcp: rcpMapping, ssp: sspMapping };
         const selectedData = filteredData.map(item => {
             let filteredItem = {};
             columnsToDownload.forEach(key => {
-                filteredItem[key] = item[key];
+                filteredItem[columnNames[key] ?? key] = valueMaps[key]?.[item[key]] ?? item[key];
             });
             return filteredItem;
         });
@@ -938,19 +942,19 @@
         </div>
     {/if}
 
-    <nav class="flex min-w-[240px] flex-col gap-3 mb-8 font-sans text-base font-normal text-blue-gray-700">
+    <nav class="flex min-w-[240px] flex-col gap-3 mb-2 font-sans text-base font-normal text-blue-gray-700">
         <div role="contentinfo"
         class="flex items-center w-full p-3 leading-tight transition-all rounded-lg outline-none text-start hover:bg-blue-gray-50 hover:bg-opacity-80 hover:text-blue-gray-900 focus:bg-blue-gray-50 focus:bg-opacity-80 focus:text-blue-gray-900 active:bg-blue-gray-50 active:bg-opacity-80 active:text-blue-gray-900">
             <div class="grid mr-4 place-items-center">
-                <Icon icon="tabler:building-factory" style="font-size: 30px" />
+                <Icon icon="material-symbols:partly-cloudy-day-outline" style="font-size: 30px" />
             </div>
             <div class="group flex relative">
-                <span>Fossil-fuel Emphasis</span> 
+                <span>Future Weather</span> 
             </div>
         </div>
-        <div class="flex leading-normal pl-16 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+        <div class="flex leading-normal pl-16 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
             <fieldset>
-                <div class="flex flex-row gap-5">
+                <div class="flex flex-col gap-1">
                 {#each rcps as r}
                 <div>
                     <input type="radio" id={r} name="rcps" value={r} bind:group={selectedRCP}/>
@@ -967,13 +971,13 @@
                 <Icon icon="ix:user-management" style="font-size: 30px" />
             </div>
             <div class="group flex relative">
-                <span>Population & Economic Growth</span> 
+                <span>Population & GDP Growth</span> 
             </div>
         </div>
 
-        <div class="flex leading-normal pl-16 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+        <div class="flex leading-normal pl-16 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
             <fieldset>
-                <div class="flex flex-row gap-5">
+                <div class="flex flex-col gap-1">
                 {#each ssps as s}
                 <div>
                     <input type="radio" id={s} name="ssps" value={s} bind:group={selectedSSP}/>
@@ -985,7 +989,7 @@
         </div>
     </nav>
 
-    <div class="pt-9 ">
+    <div class="pt-4 ">
         <h5 class="block font-sans text-xl antialiased font-semibold tracking-normal text-blue-gray-900">
         Visualization Options
         </h5>
