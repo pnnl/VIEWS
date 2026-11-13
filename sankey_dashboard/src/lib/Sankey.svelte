@@ -1,6 +1,6 @@
 <script>
     import Papa from 'papaparse';
-    import { parquetRead } from 'hyparquet';
+    import { parquetRead, parquetMetadata } from 'hyparquet';
     import { onMount } from 'svelte';
     import { base } from '$app/paths';
     import Icon from "@iconify/svelte";
@@ -33,6 +33,23 @@
     const NODE_PAD_PX = 10;        
     const WATER_NODE_PAD_PX = 30;  
     const LABEL_LINE_PX = 20;      
+
+    // ---- Performance instrumentation (dev only; visible in DevTools Performance panel + console) ----
+    const PERF_LOG = import.meta.env.DEV;
+    function logTiming(label, start) {
+        if (!PERF_LOG) return;
+        try { performance.measure(`sankey: ${label}`, { start }); } catch { /* older browsers */ }
+        console.debug(`[sankey perf] ${label}: ${(performance.now() - start).toFixed(1)} ms`);
+    }
+
+    // Columns the client actually uses from the energy level parquets. Intersected with the
+    // file schema at load time so columns dropped by the R script (e.g. units/diagram) are fine.
+    const ENERGY_COLUMNS = [
+        'scenario', 'region', 'year', 'source', 'target', 'source_position', 'target_position',
+        'level', 'value', 'color', 'units', 'diagram', 'ssp', 'rcp', 'source_key'
+    ];
+    const RENDER_DEBOUNCE_MS = 80;
+    const FRAME_CACHE_MAX = 24;
 
     async function fetchParquet(fileName) {
         const response = await fetch(`${base}/${fileName}`);
@@ -91,6 +108,9 @@
     let energyLevelDataCache = {};
     let pendingLevelPromises = {};
     let isLoadingEnergyData = false;
+    const frameCache = new Map();  // render key -> { frames, labels, warnings }
+    let renderTimer = null;
+    let prefetchScheduled = false;
     let selectedStates = ['CA'];
     let selectedDetailLevel = '1'; // maps to 1, 2, 3 (always includes level 0)
     let renderCounter = 0;
@@ -121,7 +141,7 @@
         losses: 'rgba(105, 105, 105, 0.6)'
     };
 
-    let selectedColorPalette = 'energy-water';
+    let selectedColorPalette = 'data';
 
     // Collapsible Visualization Options sections (collapsed by default)
     let expandedSections = { palette: false, flows: false, waterUnits: false, energyUnits: false };
@@ -226,7 +246,9 @@
         return 'energy';
     }
 
-    function getEnergyWaterNodeType(nodeLabel, data) {
+    // nodeUnits: Map(label -> { ej: bool, water: bool }) built in a single pass over the
+    // filtered rows (replaces a per-label data.filter() scan).
+    function getEnergyWaterNodeType(nodeLabel, nodeUnits) {
         // Named categories always take precedence.
         if (isLossNode(nodeLabel)) {
             return 'losses';
@@ -236,18 +258,15 @@
             return 'electricity';
         }
 
-        // Find all flows connected to this node.
-        const connectedRows = data.filter(
-            (row) => row.source === nodeLabel || row.target === nodeLabel
-        );
+        const info = nodeUnits.get(nodeLabel);
 
         // Any non-electricity node associated with an EJ flow is Energy.
-        if (connectedRows.some((row) => String(row.units ?? '').trim() === 'EJ')) {
+        if (info?.ej) {
             return 'energy';
         }
 
         // Nodes associated with water-unit flows are Water.
-        if (connectedRows.some((row) => isWaterUnit(row.units))) {
+        if (info?.water) {
             return 'water';
         }
 
@@ -299,7 +318,19 @@
         }
     }
 
+    // Memoize color math: the same (source, target) color pairs repeat across every frame.
+    const interpolateCache = new Map();
     function interpolateRgba(sourceColor, targetColor, alpha = 0.35) {
+        const key = `${sourceColor}|${targetColor}|${alpha}`;
+        let cached = interpolateCache.get(key);
+        if (cached === undefined) {
+            cached = interpolateRgbaUncached(sourceColor, targetColor, alpha);
+            interpolateCache.set(key, cached);
+        }
+        return cached;
+    }
+
+    function interpolateRgbaUncached(sourceColor, targetColor, alpha) {
         const s = parseColor(sourceColor);
         const t = parseColor(targetColor);
         const r = Math.round((s[0] + t[0]) / 2);
@@ -377,13 +408,9 @@
     function generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
         let filteredData;
         if (selectedDiagram === 'Energy') {
-            const stateSet = new Set(currentSelectedStates);
-            // Levels 1-3 always include level 0, and level 0 is not a standalone option
-            const matchingRows = data.filter(row => 
-                stateSet.has(row.region) && 
-                row.ssp === selectedSSP && 
-                row.rcp === selectedRCP 
-            );
+            // Indexed lookup: only the selected states' rows for this scenario
+            // (L0 file + active detail file, all row levels incl. level 4 for High).
+            const matchingRows = collectEnergyRows(data, selectedSSP, selectedRCP, currentSelectedStates);
 
             // Sum flows across multiple selected states.
             // Node colors come from the nodes parquet. In 'data' mode, edges are
@@ -426,16 +453,34 @@
         const yCoords = [];
         const frames = [];
 
-        // collect all unique labels
+        // Single pass: unique labels, per-node unit types, and positive rows bucketed by year.
+        const nodeUnits = new Map();
+        const markNode = (label, ej, water) => {
+            let info = nodeUnits.get(label);
+            if (!info) nodeUnits.set(label, (info = { ej: false, water: false }));
+            if (ej) info.ej = true;
+            if (water) info.water = true;
+        };
+        const rowsByYear = new Map();
         filteredData.forEach(row => {
             labels.add(row.source);
             labels.add(row.target);
+            const ej = String(row.units ?? '').trim() === 'EJ';
+            const water = !ej && isWaterUnit(row.units);
+            markNode(row.source, ej, water);
+            markNode(row.target, ej, water);
+            if (Number(row.value) > 0) {
+                let list = rowsByYear.get(row.year);
+                if (!list) rowsByYear.set(row.year, (list = []));
+                list.push(row);
+            }
         });
 
         // One fixed layout for every frame -> no node drift during animation
         let nodeX, nodeY;
         let labelsArray;
         try {
+            const tLayout = performance.now();
             const layoutRes = selectedDiagram === 'Energy'
                 ? computeEnergyLayout([...labels], filteredData, energyNodeTable, currentDetailLevel,
                     { padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX })
@@ -445,7 +490,8 @@
             labelsArray = layoutRes.labels; // Use the canonical deterministically sorted label order!
             nodeX = layoutRes.x;
             nodeY = layoutRes.y;
-            
+            logTiming(`layout (${labels.size} nodes, ${filteredData.length} links)`, tLayout);
+
             layoutErrorMessage = '';
         } catch (err) {
             console.error('Sankey layout error:', err);
@@ -454,7 +500,7 @@
         }
 
         const energyWaterNodeColors = labelsArray.map((label) => {
-            const nodeType = getEnergyWaterNodeType(label, filteredData);
+            const nodeType = getEnergyWaterNodeType(label, nodeUnits);
             return energyWaterPalette[nodeType];
         });
 
@@ -463,7 +509,7 @@
         const pos = new Map(labelsArray.map((l, i) => [l, { x: nodeX[i], y: finalNodeY[i], c: energyWaterNodeColors[i] }]));
 
         years.forEach(year => {
-            const yearData = filteredData.filter(row => row.year === year && Number(row.value) > 0);
+            const yearData = rowsByYear.get(year) ?? [];
             const used = new Set(yearData.flatMap(row => [row.source, row.target]));
             const frameLabels = labelsArray.filter(l => used.has(l));
             const idx = new Map(frameLabels.map((l, i) => [l, i]));
@@ -546,6 +592,7 @@
         const fileName = `gcam_usa_energy_l${levelKey}.parquet`;
 
         pendingLevelPromises[levelKey] = (async () => {
+            const tFetch = performance.now();
             const response = await fetch(`${base}/${fileName}`);
 
             if (!response.ok) {
@@ -553,47 +600,150 @@
             }
 
             const arrayBuffer = await response.arrayBuffer();
+            logTiming(`fetch ${fileName} (${(arrayBuffer.byteLength / 1e6).toFixed(1)} MB)`, tFetch);
+
+            // Decode only the columns we use (and that exist in this file).
+            const tParse = performance.now();
+            const metadata = parquetMetadata(arrayBuffer);
+            const available = new Set(metadata.schema.slice(1).map(s => s.name));
+            const columns = ENERGY_COLUMNS.filter(c => available.has(c));
             let parsedRows = [];
 
             await parquetRead({
                 file: arrayBuffer,
+                metadata,
+                columns,
                 rowFormat: 'object',
                 onComplete: (data) => {
                     parsedRows = data;
                 }
             });
+            logTiming(`parse ${fileName} (${parsedRows.length} rows)`, tParse);
 
-            const processedRows = parsedRows
-                .filter(
-                    (r) =>
-                        r.source &&
-                        r.target &&
-                        r.year != null &&
-                        r.scenario &&
-                        r.region &&
-                        String(r.scenario).includes('cooler')
-                )
-                .map((r) => {
-                    const rcpMatch = String(r.scenario).match(rcpRegex);
-                    const sspMatch = String(r.scenario).match(sspRegex);
-                    return {
-                        ...r,
-                        rcp: rcpMatch ? rcpMatch[0].toLowerCase() : null,
-                        ssp: sspMatch ? sspMatch[0].toLowerCase() : null
-                    };
-                });
+            const tIndex = performance.now();
+            const levelIndex = buildEnergyIndex(parsedRows);
+            logTiming(`index ${fileName} (${levelIndex.rowCount} rows kept)`, tIndex);
 
             energyLevelDataCache = {
                 ...energyLevelDataCache,
-                [levelKey]: processedRows
+                [levelKey]: levelIndex
             };
 
-            return processedRows;
+            return levelIndex;
         })().finally(() => {
             delete pendingLevelPromises[levelKey];
         });
 
         return pendingLevelPromises[levelKey];
+    }
+
+    /**
+     * One pass over parsed rows -> Map('ssp|rcp' -> Map(region -> rows[])).
+     * Rows are kept by reference (no object copies). All row levels are kept
+     * (e.g. l3.parquet contains level 3 and level 4 rows; both are needed for High).
+     */
+    function buildEnergyIndex(rows) {
+        const index = new Map();
+        const hotterCache = new Map();
+        const keyCache = new Map();
+        let rowCount = 0;
+
+        for (let i = 0; i < rows.length; i++) {
+            const r = rows[i];
+            if (!r.source || !r.target || r.year == null || !r.region || !r.scenario) continue;
+
+            let isHotter = hotterCache.get(r.scenario);
+            if (isHotter === undefined) {
+                isHotter = String(r.scenario).includes('hotter');
+                hotterCache.set(r.scenario, isHotter);
+            }
+            if (!isHotter) continue;
+
+            // Fallback for files without precomputed ssp/rcp columns.
+            if (r.ssp == null || r.rcp == null) {
+                const s = String(r.scenario);
+                r.ssp = r.ssp ?? (s.match(sspRegex)?.[0] ?? null);
+                r.rcp = r.rcp ?? (s.match(rcpRegex)?.[0] ?? null);
+            }
+            if (typeof r.year === 'bigint') r.year = Number(r.year);
+            if (r.units == null) r.units = 'EJ';
+            if (r.diagram == null) r.diagram = 'Energy';
+
+            const rawKey = `${r.ssp}|${r.rcp}`;
+            let key = keyCache.get(rawKey);
+            if (key === undefined) {
+                key = rawKey.toLowerCase();
+                keyCache.set(rawKey, key);
+            }
+
+            let byRegion = index.get(key);
+            if (!byRegion) index.set(key, (byRegion = new Map()));
+            let list = byRegion.get(r.region);
+            if (!list) byRegion.set(r.region, (list = []));
+            list.push(r);
+            rowCount++;
+        }
+
+        return { index, rowCount };
+    }
+
+    /** Active energy dataset = L0 index + the selected detail-level index. */
+    function makeEnergyData(detailLevel) {
+        return {
+            detailLevel: String(detailLevel),
+            levels: [energyLevelDataCache['0'], energyLevelDataCache[String(detailLevel)]].filter(Boolean)
+        };
+    }
+
+    /** Rows for the selected scenario + states only (no full-dataset scan). */
+    function collectEnergyRows(energyData, ssp, rcp, states) {
+        const key = `${ssp}|${rcp}`.toLowerCase();
+        const out = [];
+        for (const lvl of energyData?.levels ?? []) {
+            const byRegion = lvl.index.get(key);
+            if (!byRegion) continue;
+            for (const state of states) {
+                const list = byRegion.get(state);
+                if (!list) continue;
+                for (let i = 0; i < list.length; i++) out.push(list[i]);
+            }
+        }
+        return out;
+    }
+
+    /** After the first Energy render, quietly load the other detail levels in idle time. */
+    function schedulePrefetchOtherLevels() {
+        if (prefetchScheduled || typeof window === 'undefined') return;
+        prefetchScheduled = true;
+        const idle = window.requestIdleCallback
+            ? (cb) => window.requestIdleCallback(cb, { timeout: 5000 })
+            : (cb) => setTimeout(cb, 1500);
+        const run = async () => {
+            for (const { value } of detailLevels) {
+                if (energyLevelDataCache[value] || pendingLevelPromises[value]) continue;
+                try {
+                    await loadParquetLevel(value);
+                } catch (err) {
+                    console.warn(`Prefetch of energy level ${value} failed:`, err);
+                }
+                await new Promise(resolve => idle(resolve));
+            }
+        };
+        idle(run);
+    }
+
+    function renderCacheKey(selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
+        return selectedDiagram === 'Energy'
+            ? ['E', currentDetailLevel, selectedSSP, selectedRCP, [...currentSelectedStates].sort().join(','), selectedColorPalette].join('|')
+            : ['W', selectedDiagram, selectedSSP, selectedRCP, selectedClimate, selectedEnergyUnits, selectedWaterUnits, selectedColorPalette].join('|');
+    }
+
+    function scheduleRender(args) {
+        clearTimeout(renderTimer);
+        renderTimer = setTimeout(() => {
+            renderTimer = null;
+            initializeHybridSankey(...args);
+        }, RENDER_DEBOUNCE_MS);
     }
 
     async function loadGcamEnergyForDetailLevel(detailLevel) {
@@ -612,10 +762,8 @@
                     : fetchParquet('gcam_usa_energy_nodes.parquet').then(rows => { energyNodeTable = buildNodeTable(rows); })
             ]);
 
-            // Merge level 0 plus the active detail level
-            const l0Rows = energyLevelDataCache['0'] || [];
-            const detailRows = energyLevelDataCache[String(detailLevel)] || [];
-            gcamEnergyData = [...l0Rows, ...detailRows];
+            // Level 0 plus the active detail level (indexed, no array concatenation)
+            gcamEnergyData = makeEnergyData(detailLevel);
             loadedDetailLevel = String(detailLevel);
         } catch (error) {
             console.error('Error loading split GCAM energy parquet files:', error);
@@ -626,7 +774,27 @@
 
     // Energy-water Sankey
     function initializeHybridSankey(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
-        const { frames, labels } = generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
+        const tRender = performance.now();
+        const cacheKey = renderCacheKey(selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
+        let cached = frameCache.get(cacheKey);
+        if (cached) {
+            // LRU touch + restore side-effect state produced by generateSankeyFrames
+            frameCache.delete(cacheKey);
+            frameCache.set(cacheKey, cached);
+            layoutWarnings = cached.warnings;
+            layoutErrorMessage = '';
+        } else {
+            const result = generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
+            cached = { ...result, warnings: layoutWarnings };
+            if (result.frames && result.frames.length > 0) {
+                frameCache.set(cacheKey, cached);
+                if (frameCache.size > FRAME_CACHE_MAX) {
+                    frameCache.delete(frameCache.keys().next().value);
+                }
+            }
+            logTiming(`build frames [${cacheKey}]`, tRender);
+        }
+        const { frames, labels } = cached;
         if (!frames || frames.length === 0) return;
 
         let activeIndex = 0;
@@ -734,8 +902,20 @@
         const targetElement = document.getElementById("hybridSankeyDiagram");
         if (!targetElement) return;
 
-        Plotly.react(targetElement, initialFrame.data, layout, { responsive: true })
+        // One call with frames included: replaces old frames (no accumulation) and avoids a
+        // second pass through Plotly.addFrames.
+        const tPlotly = performance.now();
+        Plotly.react(targetElement, {
+            data: initialFrame.data,
+            layout,
+            frames,
+            config: { responsive: true }
+        })
             .then(() => {
+                logTiming('Plotly.react', tPlotly);
+                if (thisRender === renderCounter && selectedDiagram === 'Energy') {
+                    schedulePrefetchOtherLevels();
+                }
                 if (thisRender === renderCounter) {
                     if (targetElement.on && !targetElement._hasSliderChangeListener) {
                         targetElement._hasSliderChangeListener = true;
@@ -765,8 +945,6 @@
                             });
                         });
                     }
-
-                    return Plotly.addFrames(targetElement, frames);
                 }
             })
             .catch(err => {
@@ -796,11 +974,8 @@
 
         if (!hasL0 || !hasDetail || !hasNodeTable) {
             loadGcamEnergyForDetailLevel(selectedDetailLevel);
-        } else if (gcamEnergyData !== undefined && loadedDetailLevel !== String(selectedDetailLevel)) {
-            const l0Rows = energyLevelDataCache['0'] || [];
-            const detailRows = energyLevelDataCache[String(selectedDetailLevel)] || [];
-
-            gcamEnergyData = [...l0Rows, ...detailRows];
+        } else if (loadedDetailLevel !== String(selectedDetailLevel)) {
+            gcamEnergyData = makeEnergyData(selectedDetailLevel);
             loadedDetailLevel = String(selectedDetailLevel);
         }
     }
@@ -827,7 +1002,8 @@
                 )
         )
     ) {
-        initializeHybridSankey(
+        // Debounced: rapid shift-clicks / option changes coalesce into one render.
+        const renderArgs = [
             activeData,
             selectedSSP,
             selectedRCP,
@@ -838,25 +1014,24 @@
             selectedStates,
             selectedDetailLevel,
             selectedColorPalette
-        );
+        ];
+        scheduleRender(renderArgs);
     }
 
     function downloadCSV(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel) {
-        if (!data || !data.length) return;
+        if (!data) return;
         
         let filteredData;
         let columnsToDownload;
 
         if (selectedDiagram === 'Energy') {
-            const stateSet = new Set(currentSelectedStates);
-            filteredData = data.filter(row => 
-                stateSet.has(row.region) &&
-                row.ssp === selectedSSP &&
-                row.rcp === selectedRCP &&
-                (String(row.level) === '0' || String(row.level) === '0.0' || String(row.level) === String(currentDetailLevel))
-            );
+            // `data` holds only the L0 file + the active detail-level file
+            // (e.g. High = l3.parquet, which holds both level 3 and level 4 rows), so do
+            // not filter on row.level here — that previously dropped level-4 rows.
+            filteredData = collectEnergyRows(data, selectedSSP, selectedRCP, currentSelectedStates);
             columnsToDownload = ["rcp", "ssp", "region", "year", "source", "target", "level", "units", "diagram", "value"];
         } else {
+            if (!data.length) return;
             const selectedUnitsList = [selectedEnergyUnits, selectedWaterUnits];
             filteredData = data.filter(row => (row.ssp === selectedSSP) && (row.rcp === selectedRCP) && (row.climate_sensitivity === selectedClimate) && (row.diagram === selectedDiagram) && (selectedUnitsList.includes(row.units)));
             columnsToDownload = ["rcp", 'ssp', "source", "target", "year", "unit_value", "units", "diagram"];
