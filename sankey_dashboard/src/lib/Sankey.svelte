@@ -18,6 +18,85 @@
     const waterUnitMapping = {'km3': 'Cubic Kilometers', 'billion_gallons': 'Billion Gallons', 'million_acre_ft': 'Million Acre-Feet'};
     const energyUnitMapping = {'EJ': 'Exajoules', 'quads': 'Quads', 'terawatt_hours': 'Terawatt-hours'};
 
+    // ---- Tooltip formatting helpers ----
+    const unitShortName = {
+        'EJ': 'EJ', 'quads': 'quads', 'terawatt_hours': 'TWh',
+        'km3': 'km³', 'billion_gallons': 'billion gal', 'million_acre_ft': 'million acre-ft'
+    };
+    const NODE_HOVER_MAX_INPUTS = 8;
+    const thousandsFmt = new Intl.NumberFormat('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
+
+    function unitLabel(units) {
+        const u = String(units ?? '').trim();
+        if (!u) return 'EJ';
+        return unitShortName[u] ?? u;
+    }
+
+    /** 3 decimal places, or 3 significant figures when |v| < 0.1. */
+    function formatFlowValue(v) {
+        const n = Number(v);
+        if (!Number.isFinite(n)) return '–';
+        if (n === 0) return '0';
+        if (Math.abs(n) >= 0.1) return thousandsFmt.format(n);
+        return String(Number(n.toPrecision(3)));
+    }
+
+    function formatWithUnits(v, units) {
+        return `${formatFlowValue(v)} ${unitLabel(units)}`;
+    }
+
+    function formatPct(p) {
+        if (!Number.isFinite(p)) return '–';
+        if (p > 0 && p < 0.001) return '<0.1%';
+        return `${(p * 100).toFixed(1)}%`;
+    }
+
+    function escapeHtml(s) {
+        return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function displayValue(row) {
+        const uv = parseFloat(row.unit_value);
+        return Number.isFinite(uv) ? uv : (parseFloat(row.value) || 0);
+    }
+
+    /**
+     * nodeFlows: Map(label -> { in: Map(units -> Map(source -> value)), out: Map(units -> total) })
+     * Returns an HTML string per frame label for the node hover template.
+     */
+    function buildNodeHover(frameLabels, nodeFlows) {
+        return frameLabels.map(label => {
+            const info = nodeFlows.get(label);
+            if (!info) return '';
+            const lines = [];
+            if (info.in.size > 0) {
+                for (const [units, bySource] of info.in) {
+                    let total = 0;
+                    for (const v of bySource.values()) total += v;
+                    lines.push(`Total in: ${formatWithUnits(total, units)}`);
+                    lines.push('Inputs:');
+                    const sorted = [...bySource.entries()].sort((a, b) => b[1] - a[1]);
+                    const shown = sorted.slice(0, NODE_HOVER_MAX_INPUTS);
+                    const rest = sorted.slice(NODE_HOVER_MAX_INPUTS);
+                    for (const [src, v] of shown) {
+                        const share = total > 0 ? v / total : NaN;
+                        lines.push(`&nbsp;&nbsp;${escapeHtml(src)}: ${formatWithUnits(v, units)} (${formatPct(share)})`);
+                    }
+                    if (rest.length > 0) {
+                        const restSum = rest.reduce((s, [, v]) => s + v, 0);
+                        const share = total > 0 ? restSum / total : NaN;
+                        lines.push(`&nbsp;&nbsp;Other (${rest.length}): ${formatWithUnits(restSum, units)} (${formatPct(share)})`);
+                    }
+                }
+            } else {
+                for (const [units, total] of info.out) {
+                    lines.push(`Total out: ${formatWithUnits(total, units)}`);
+                }
+            }
+            return lines.join('<br>');
+        });
+    }
+
     const detailLevels = [
         { label: 'Low', value: '1' },
         { label: 'Medium', value: '2' },
@@ -370,7 +449,7 @@
 
     function clearStates() {
         // Keep at least one default selected
-        selectedStates = ['WA'];
+        selectedStates = ['CA'];
     }
 
     function resetLayout() {
@@ -525,6 +604,12 @@
             const values = [];
             const linkColors = [];
             const flowHoverLabels = [];
+            const nodeFlows = new Map();
+            const getNodeFlow = (label) => {
+                let f = nodeFlows.get(label);
+                if (!f) nodeFlows.set(label, (f = { in: new Map(), out: new Map() }));
+                return f;
+            };
             const nodeColors = selectedColorPalette === 'energy-water'
                 ? frameLabels.map(l => pos.get(l).c)
                 : frameLabels.map(l =>
@@ -543,8 +628,22 @@
                     if (row.source_color) nodeColors[sIdx] = row.source_color;
                     if (row.target_color) nodeColors[tIdx] = row.target_color;
                 }
-                flowHoverLabels.push([parseFloat(row.unit_value ?? row.value), row.source_key ?? '']);
+                const v = displayValue(row);
+                const units = row.units || 'EJ';
+                flowHoverLabels.push({
+                    value: formatWithUnits(v, units),
+                    fuel: escapeHtml(row.source_key ?? '')
+                });
+
+                // Node totals: inputs aggregated per (units, source) so color-split edges merge.
+                const tFlow = getNodeFlow(row.target);
+                let bySource = tFlow.in.get(units);
+                if (!bySource) tFlow.in.set(units, (bySource = new Map()));
+                bySource.set(row.source, (bySource.get(row.source) ?? 0) + v);
+                const sFlow = getNodeFlow(row.source);
+                sFlow.out.set(units, (sFlow.out.get(units) ?? 0) + v);
             });
+            const nodeHover = buildNodeHover(frameLabels, nodeFlows);
 
             frames.push({
                 name: year,
@@ -558,7 +657,8 @@
                         thickness: 20,
                         line: { color: "black", width: 0.5 },
                         label: frameLabels,
-                        hoverinfo: "none",
+                        customdata: nodeHover,
+                        hovertemplate: "<b>%{label}</b><br>%{customdata}<extra></extra>",
                         color: nodeColors,
                         x: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).x),
                         y: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).y)
@@ -570,8 +670,8 @@
                         color: linkColors,
                         customdata: flowHoverLabels,
                         hovertemplate: selectedColorPalette === 'data'
-                            ? "Source: %{source.label}<br>Fuel: %{customdata[1]}<br>Target: %{customdata[0]}<extra></extra>"
-                            : "Source: %{source.label}<br>Target: %{customdata[0]}<extra></extra>"
+                            ? "%{source.label} → %{target.label}<br>Flow: %{customdata.value}<br>Fuel: %{customdata.fuel}<extra></extra>"
+                            : "%{source.label} → %{target.label}<br>Flow: %{customdata.value}<extra></extra>"
                     }
                 }]
             });
