@@ -14,20 +14,19 @@ Energy and water systems are interconnected. Water supports energy production, a
 * Examine how resource flows change over time under alternative socioeconomic and future weather scenarios.
 * Provide downloadable data to support further analysis.
 
-![VIEWS dashboard showing state-level energy flows](sankey_dashboard/static/stateflow.png)
+![VIEWS dashboard showing state-level energy flows](dashboard/static/stateflow.png)
 
-The dashboard provides three diagram types: **Energy**, **Water**, and combined **Energy & Water**. Users can select scenarios and units, animate changes over time, and download the data behind their selections. The Energy diagram also supports selecting one or more US states and choosing Low, Medium, or High detail.
+The dashboard provides three diagram types: **Energy**, **Water**, and combined **Energy & Water**. Users can select one or more US states, a level of detail (Low, Medium, or High), scenarios, and units, animate changes over time, and download the data and images behind their selections.
 
-<!-- IMAGE PLACEHOLDER: Add sankey_dashboard/static/energy-water.png -->
-![Combined energy and water flows in VIEWS](sankey_dashboard/static/energy-water.png)
+![Combined energy and water flows in VIEWS](dashboard/static/energy-water.png)
 
 
 ## Installation
 
-To run the dashboard locally, install [Node.js](https://nodejs.org/) 18 or later with npm, then run the following from the repository root:
+To run the dashboard locally, install [Node.js](https://nodejs.org/) 20 or later with npm, then run the following from the repository root:
 
 ```bash
-cd sankey_dashboard
+cd dashboard
 npm install
 npm run dev
 ```
@@ -40,10 +39,11 @@ With the dashboard running:
 
 1. Choose **Energy**, **Water**, or **Energy & Water**.
 2. Select a population/GDP growth and future weather scenario.
-3. For the Energy diagram, select one or more US states and a level of detail.
+3. Select one or more US states and a level of detail.
 4. Choose units and a color palette.
 5. Move the year slider or press play to explore changes over time.
-6. Download the current selection as a CSV for further analysis.
+6. Download the current selection as a CSV, or the diagram for the year shown as a PNG or SVG image.
+7. Use **Copy Link to This View** to share a URL that reopens the dashboard with the same selections and year.
 
 Energy flows can be displayed in exajoules, quads, or terawatt-hours. Water flows can be displayed in cubic kilometers, billion gallons, or million acre-feet.
 
