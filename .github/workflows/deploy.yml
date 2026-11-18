@@ -1,41 +1,111 @@
+# Builds the dashboard and publishes it to the gh-pages branch.
+#
+#   main    -> https://pnnl.github.io/VIEWS/       (released site, gh-pages root)
+#   develop -> https://pnnl.github.io/VIEWS/dev/   (preview site, gh-pages dev/)
+#
+# Both sites live side by side on gh-pages. Each branch only replaces its own
+# folder, so a develop push never changes the released site and vice versa.
+# gh-pages is rewritten as a single commit on every deploy so the large
+# parquet files do not accumulate in its history.
+#
+# GitHub Pages must be set to: Settings -> Pages -> Deploy from a branch -> gh-pages / (root).
+
 name: Deploy
 
 on:
   push:
-    branches: [ main ]
+    branches: [main, develop]
+    paths:
+      - 'dashboard/**'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# main and develop both write gh-pages; queue deploys instead of racing.
+concurrency:
+  group: gh-pages
+  cancel-in-progress: false
 
 jobs:
-  build:
+  deploy:
+    if: github.ref_name == 'main' || github.ref_name == 'develop'
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ./sankey_dashboard
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
         with:
-          node-version: 20
-          cache-dependency-path: '**/package-lock.json'
-          cache: 'npm'
+          node-version: 22
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+
+      - name: Select deploy target
+        id: target
+        run: |
+          if [ "${GITHUB_REF_NAME}" = "main" ]; then
+            echo "base_path=/VIEWS" >> "$GITHUB_OUTPUT"
+            echo "dest=."           >> "$GITHUB_OUTPUT"
+            echo "channel=release"  >> "$GITHUB_OUTPUT"
+          else
+            echo "base_path=/VIEWS/dev" >> "$GITHUB_OUTPUT"
+            echo "dest=dev"             >> "$GITHUB_OUTPUT"
+            echo "channel=preview"      >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Install dependencies
-        run: npm install
+        working-directory: dashboard
+        run: npm ci
+
       - name: Build
+        working-directory: dashboard
         env:
           NODE_ENV: production
+          BASE_PATH: ${{ steps.target.outputs.base_path }}
+          VITE_DEPLOY_CHANNEL: ${{ steps.target.outputs.channel }}
+          VITE_COMMIT_SHA: ${{ github.sha }}
         run: npm run build
-      - name: Commit the build dir
-        run: |
-          cd build
-          git init
-          git add -A
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git commit -m 'deploy' -a || true
-      - name: Push changes to gh-pages
-        uses: ad-m/github-push-action@master
-        with:
-          branch: gh-pages
-          directory: sankey_dashboard/build
-          force: true
-          github_token: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Checkout gh-pages
+        uses: actions/checkout@v4
+        with:
+          ref: gh-pages
+          path: gh-pages
+
+      - name: Copy build into its folder
+        env:
+          DEST: ${{ steps.target.outputs.dest }}
+        run: |
+          if [ "$DEST" = "." ]; then
+            # Release: replace everything at the root except the preview folder.
+            rsync -a --checksum --delete --exclude '/.git' --exclude '/dev/' dashboard/build/ gh-pages/
+          else
+            mkdir -p "gh-pages/$DEST"
+            rsync -a --checksum --delete "dashboard/build/" "gh-pages/$DEST/"
+          fi
+          touch gh-pages/.nojekyll
+
+      - name: Check every script the pages reference was published
+        env:
+          DEST: ${{ steps.target.outputs.dest }}
+        run: |
+          missing=0
+          for page in gh-pages/"$DEST"/*.html; do
+            for asset in $(grep -o '_app/immutable/[^"]*\.js' "$page" | sort -u); do
+              [ -f "gh-pages/$DEST/$asset" ] || { echo "::error::$page references missing $asset"; missing=1; }
+            done
+          done
+          exit $missing
+
+      - name: Publish gh-pages
+        working-directory: gh-pages
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout --orphan deploy
+          git add -A
+          git commit -q -m "deploy ${GITHUB_REF_NAME} @ ${GITHUB_SHA::7}"
+          git push --force origin deploy:gh-pages

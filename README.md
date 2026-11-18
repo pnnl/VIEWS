@@ -47,6 +47,17 @@ With the dashboard running:
 
 Energy flows can be displayed in exajoules, quads, or terawatt-hours. Water flows can be displayed in cubic kilometers, billion gallons, or million acre-feet.
 
+## Deployment
+
+The GitHub Actions workflow in `.github/workflows/deploy.yml` builds the dashboard and publishes it to the `gh-pages` branch on every push that changes `dashboard/`:
+
+| Branch | Site | Purpose |
+| --- | --- | --- |
+| `main` | [pnnl.github.io/VIEWS](https://pnnl.github.io/VIEWS/) | Released dashboard |
+| `develop` | [pnnl.github.io/VIEWS/dev](https://pnnl.github.io/VIEWS/dev/) | Preview of upcoming changes, marked with a banner |
+
+Each branch only replaces its own folder on `gh-pages`, so the two sites never overwrite each other. A deploy can also be started by hand from the repository's **Actions** tab (**Deploy** > **Run workflow**). GitHub Pages must be set to *Deploy from a branch*, `gh-pages`, `/ (root)`.
+
 ## Methodology
 
 ### Scenario Design
@@ -64,7 +75,7 @@ For additional information on the meteorological projections, please refer to: J
 
 ### GCAM-USA IM3 Experiment
 
-![GCAM-USA IM3 Experiment Diagram](sankey_dashboard/static/im3_exp_modeling_diagram.png)
+![GCAM-USA IM3 Experiment Diagram](dashboard/static/im3_exp_modeling_diagram.png)
 
 For more information on IM3, please see [https://im3.pnnl.gov](https://im3.pnnl.gov)
 
@@ -76,7 +87,7 @@ GCAM Modeling Outputs Underlying Visualizations: Zhao, M., Ahsan, H., Binsted, M
 
 | Global Change Analysis Model (GCAM) | GCAM-USA Spatial Resolutions |
 | --- | --- |
-| ![Global Change Analysis Model (GCAM)](sankey_dashboard/static/gcam.svg) | ![GCAM-USA Spatial Resolutions](sankey_dashboard/static/resolutions.svg) |
+| ![Global Change Analysis Model (GCAM)](dashboard/static/gcam.svg) | ![GCAM-USA Spatial Resolutions](dashboard/static/resolutions.svg) |
 
 ## Acknowledgments
 
