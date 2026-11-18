@@ -99,8 +99,91 @@ function resolveIntraColumn(rows, placement, warnings) {
     return { intermediates, pred };
 }
 
-export function computeEnergyLayout(labels, rows, nodeTable, level, { padPx = 15, plotHeightPx = 600 } = {}) {
+export function computeEnergyLayout(labels, rows, nodeTable, level, opts = {}) {
     const placement = tableColumnsAndOrder(labels, nodeTable, level, primaryRanks(rows, nodeTable));
+    return layoutFromPlacement(labels, rows, placement, opts);
+}
+
+// Water nodes have no table columns. Their column is their depth in the water
+// graph (source type 0, basin 1, use category 2, end uses after), and within a
+// column they are grouped under their largest input, then sorted by size, with
+// losses at the bottom. In the energy-water diagram the energy nodes keep their
+// table placement, shifted right of the water columns, so every water flow runs
+// left to right into the energy node that uses it.
+// nodeTable = null treats every node as water (the water-only diagram).
+export function computeWaterLayout(labels, rows, nodeTable, level, opts = {}) {
+    const isEnergy = l => {
+        const row = nodeTable?.get(l);
+        return Boolean(row) && row.role !== 'water' && row[`x_col_L${level}`] != null;
+    };
+    const energyLabels = labels.filter(isEnergy);
+    const waterLabels = labels.filter(l => !isEnergy(l));
+
+    const placement = energyLabels.length
+        ? tableColumnsAndOrder(energyLabels, nodeTable, level, primaryRanks(rows, nodeTable))
+        : new Map();
+    const water = waterPlacement(waterLabels, rows);
+    const waterCols = water.size ? Math.max(...[...water.values()].map(p => p.col)) + 1 : 0;
+    const minEnergyCol = Math.min(...[...placement.values()].map(p => p.col));
+    for (const p of placement.values()) p.col = p.col - minEnergyCol + waterCols;
+    for (const [l, p] of water) placement.set(l, p);
+
+    return layoutFromPlacement(labels, rows, placement, opts);
+}
+
+function waterPlacement(waterLabels, rows) {
+    const isWater = new Set(waterLabels);
+    const pred = new Map(waterLabels.map(l => [l, new Map()])); // node -> Map(parent -> flow)
+    const inV = new Map(), outV = new Map();
+    for (const r of rows) {
+        const v = Number(r.value) || 0;
+        if (!(v > 0)) continue;
+        outV.set(r.source, (outV.get(r.source) || 0) + v);
+        inV.set(r.target, (inV.get(r.target) || 0) + v);
+        if (isWater.has(r.source) && isWater.has(r.target) && r.source !== r.target) {
+            const p = pred.get(r.target);
+            p.set(r.source, (p.get(r.source) || 0) + v);
+        }
+    }
+    const size = new Map(waterLabels.map(l => [l, Math.max(inV.get(l) || 0, outV.get(l) || 0)]));
+
+    // Column = longest path from a water source, ignoring links that close a cycle
+    const depth = new Map(), visiting = new Set();
+    const depthOf = n => {
+        if (depth.has(n)) return depth.get(n);
+        visiting.add(n);
+        let d = 0;
+        for (const p of pred.get(n).keys()) if (!visiting.has(p)) d = Math.max(d, depthOf(p) + 1);
+        visiting.delete(n);
+        depth.set(n, d);
+        return d;
+    };
+    waterLabels.forEach(depthOf);
+
+    const SOURCE_ORDER = ['Surface Water', 'Groundwater', 'Desalination'];
+    const placement = new Map();
+    const cols = [...new Set(waterLabels.map(l => depth.get(l)))].sort((a, b) => a - b);
+    for (const c of cols) {
+        const key = l => {
+            // largest input decides the group, so end uses sit under their category
+            let parent = null, best = -Infinity;
+            for (const [p, v] of pred.get(l)) if (v > best) { best = v; parent = p; }
+            return {
+                loss: /loss/i.test(l) ? 1 : 0,
+                src: SOURCE_ORDER.includes(l) ? SOURCE_ORDER.indexOf(l) : SOURCE_ORDER.length,
+                group: parent != null && placement.has(parent) ? placement.get(parent).order : -1,
+                size: size.get(l)
+            };
+        };
+        const col = waterLabels.filter(l => depth.get(l) === c).map(l => [l, key(l)]);
+        col.sort(([a, ka], [b, kb]) =>
+            ka.loss - kb.loss || ka.src - kb.src || ka.group - kb.group || kb.size - ka.size || a.localeCompare(b));
+        col.forEach(([l], i) => placement.set(l, { col: c, order: i + 1 }));
+    }
+    return placement;
+}
+
+function layoutFromPlacement(labels, rows, placement, { padPx = 15, plotHeightPx = 600 } = {}) {
     const padFrac = padPx / plotHeightPx;
     const warnings = [];
 

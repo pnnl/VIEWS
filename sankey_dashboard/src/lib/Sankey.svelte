@@ -1,12 +1,11 @@
 <script>
     import Papa from 'papaparse';
     import { parquetRead, parquetMetadata } from 'hyparquet';
-    import { onMount } from 'svelte';
     import { base } from '$app/paths';
+    import { browser } from '$app/environment';
     import Icon from "@iconify/svelte";
     import { slide } from 'svelte/transition';
-    import { computeNodePositions } from './sankeyLayout.js';
-    import { computeEnergyLayout } from './energyLayout.js';
+    import { computeEnergyLayout, computeWaterLayout } from './energyLayout.js';
     import { buildNodeTable } from './tableLayout.js';
 
     const sspMapping = { 'ssp3': 'Low', 'ssp5': 'High' };
@@ -22,6 +21,11 @@
     const unitShortName = {
         'EJ': 'EJ', 'quads': 'quads', 'terawatt_hours': 'TWh',
         'km3': 'km³', 'billion_gallons': 'billion gal', 'million_acre_ft': 'million acre-ft'
+    };
+    // Parquet values are EJ (energy) and km^3 (water); multiply to get the selected unit.
+    const UNIT_FACTORS = {
+        'EJ': 1, 'quads': 0.947817, 'terawatt_hours': 277.7778,
+        'km3': 1, 'billion_gallons': 264.172, 'million_acre_ft': 0.810714
     };
     const NODE_HOVER_MAX_INPUTS = 8;
     const thousandsFmt = new Intl.NumberFormat('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 3 });
@@ -103,15 +107,12 @@
         { label: 'High', value: '3' }
     ];
 
-    let energyNodeTable = null;
     let layoutWarnings = [];
 
     // This is the actual Sankey trace height used by the layout solver.
     // Controls are placed in Plotly's bottom margin, not inside this area.
     const PLOT_HEIGHT_PX = 600;
-    const NODE_PAD_PX = 10;        
-    const WATER_NODE_PAD_PX = 30;  
-    const LABEL_LINE_PX = 20;      
+    const NODE_PAD_PX = 10;
 
     // ---- Performance instrumentation (dev only; visible in DevTools Performance panel + console) ----
     const PERF_LOG = import.meta.env.DEV;
@@ -121,12 +122,26 @@
         console.debug(`[sankey perf] ${label}: ${(performance.now() - start).toFixed(1)} ms`);
     }
 
-    // Columns the client actually uses from the energy level parquets. Intersected with the
-    // file schema at load time so columns dropped by the R script (e.g. units/diagram) are fine.
-    const ENERGY_COLUMNS = [
+    // Columns the client actually uses from the flow parquets. Intersected with the
+    // file schema at load time, so files without some columns (water has no positions) are fine.
+    const PARQUET_COLUMNS = [
         'scenario', 'region', 'year', 'source', 'target', 'source_position', 'target_position',
         'level', 'value', 'color', 'units', 'diagram', 'ssp', 'rcp', 'source_key'
     ];
+
+    // Files behind each diagram and level of detail. Energy level 3 files also hold level 4.
+    // The energy-water diagram is the energy files plus the water rows that join them;
+    // the water file holds all three levels, so its rows are filtered by level.
+    function datasetFiles(diagram, level) {
+        if (diagram === 'Water') return [{ file: 'gcam_usa_water.parquet', level: Number(level) }];
+        const energy = [{ file: 'gcam_usa_energy_l0.parquet' }, { file: `gcam_usa_energy_l${level}.parquet` }];
+        return diagram === 'Energy' ? energy : [...energy, { file: `gcam_usa_energy_water_l${level}.parquet` }];
+    }
+    const NODE_TABLE_FILE = {
+        'Energy': 'gcam_usa_energy_nodes.parquet',
+        'Water': 'gcam_usa_energy_water_nodes.parquet',
+        'Energy & Water': 'gcam_usa_energy_water_nodes.parquet'
+    };
     const RENDER_DEBOUNCE_MS = 80;
     const FRAME_CACHE_MAX = 24;
 
@@ -168,9 +183,6 @@
 
     const rcps = ['rcp45', 'rcp85']; // backend identifiers 
     let selectedRCP = rcps[0]; // default to 'rcp45'
-
-    const climates = ['cooler', 'hotter']; // backend identifiers 
-    let selectedClimate = climates[0]; // default to 'Cooler'
     
     const diagrams = ['Energy & Water', 'Energy', 'Water'];  // backend identifiers 
     let selectedDiagram = diagrams[0]; // default to 'Energy & Water'
@@ -181,15 +193,14 @@
     const energy_units = ['EJ', 'quads', 'terawatt_hours'];  // backend identifiers
     let selectedEnergyUnits = energy_units[0]; // default to EJ
 
-    let energywaterdata;
-    let gcamEnergyData = null;
-    let loadedDetailLevel = null;
-    let energyLevelDataCache = {};
-    let pendingLevelPromises = {};
-    let isLoadingEnergyData = false;
+    let activeData = null;          // { key: 'diagram|level', nodeTable, levels: [{ index, level }] }
+    let fileCache = {};             // parquet file -> row index
+    let pendingFiles = {};
+    let nodeTableCache = {};        // nodes parquet file -> Map(node -> row)
+    let isLoadingData = false;
     const frameCache = new Map();  // render key -> { frames, labels, warnings }
     let renderTimer = null;
-    let prefetchScheduled = false;
+    const prefetched = new Set();   // diagrams whose other levels were prefetched
     let selectedStates = ['CA'];
     let selectedDetailLevel = '1'; // maps to 1, 2, 3 (always includes level 0)
     let renderCounter = 0;
@@ -259,17 +270,6 @@
         );
     }
 
-    function isWaterUnit(units) {
-        const unit = String(units ?? '').trim().toLowerCase();
-
-        return (
-            unit === 'km3' ||
-            unit.includes('gallon') ||
-            unit.includes('acre') ||
-            unit.includes('water')
-        );
-    }
-
     function parseColor(color) {
         if (!color) return [128, 128, 128];
         const hex = color.trim().replace(/^#/, '');
@@ -307,60 +307,39 @@
             return 'losses';
         }
 
+        // Water flows are blue, including water that ends at an energy node.
+        if (row.kind === 'Water') {
+            return 'water';
+        }
+
         // A flow originating from Electricity is yellow.
         if (isElectricityNode(row.source)) {
             return 'electricity';
         }
 
-        // Any other EJ flow is orange Energy.
-        if (String(row.units ?? '').trim() === 'EJ') {
-            return 'energy';
-        }
-
-        // Water-unit flows are blue.
-        if (isWaterUnit(row.units)) {
-            return 'water';
-        }
-
         return 'energy';
     }
 
-    // nodeUnits: Map(label -> { ej: bool, water: bool }) built in a single pass over the
-    // filtered rows (replaces a per-label data.filter() scan).
+    // nodeUnits: Map(label -> { ej: bool, water: bool }): whether a node has energy
+    // and/or water flows, built in a single pass over the filtered rows.
     function getEnergyWaterNodeType(nodeLabel, nodeUnits) {
         // Named categories always take precedence.
         if (isLossNode(nodeLabel)) {
             return 'losses';
         }
 
+        const info = nodeUnits.get(nodeLabel);
+
+        // Nodes with only water flows are Water (e.g. Electricity Water Use).
+        if (info?.water && !info.ej) {
+            return 'water';
+        }
+
         if (isElectricityNode(nodeLabel)) {
             return 'electricity';
         }
 
-        const info = nodeUnits.get(nodeLabel);
-
-        // Any non-electricity node associated with an EJ flow is Energy.
-        if (info?.ej) {
-            return 'energy';
-        }
-
-        // Nodes associated with water-unit flows are Water.
-        if (info?.water) {
-            return 'water';
-        }
-
-        // Optional fallback if some water flows have unexpected/missing units.
-        const nodeName = normalizeLabel(nodeLabel);
-
-        if (
-            nodeName.includes('water') ||
-            nodeName.includes('withdraw') ||
-            nodeName.includes('irrigation') 
-        ) {
-            return 'water';
-        }
-
-        // Default all otherwise unknown non-electricity nodes to energy.
+        // Default all other nodes to energy.
         return 'energy';
     }
 
@@ -455,76 +434,57 @@
     function resetLayout() {
         // Re-render
         if (activeData) {
-            initializeHybridSankey(activeData, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel, selectedColorPalette);
+            initializeHybridSankey(activeData, selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel, selectedColorPalette);
         }
     }
-
-    function computeWaterFrameLayout(frameLabels, yearData) {
-    let padPx = WATER_NODE_PAD_PX, res, best = null;
-    for (let attempt = 0; attempt < 8; attempt++) {
-        res = computeNodePositions(frameLabels, yearData, {
-            strict: false,
-            mirrorPlotlyHeights: true,
-            padPx,
-            plotHeightPx: PLOT_HEIGHT_PX,
-            labelSepFrac: LABEL_LINE_PX / PLOT_HEIGHT_PX
-        });
-        if (res.overflow <= 0 && res.validation.valid) {
-            best = { ...res, padPx };
-            if (res.labelsFit) return best;
-        }
-        padPx *= 1.5; // larger pad -> smaller nodes -> more room for labels
-    }
-    if (best) {
-        console.warn('Sankey: nodes do not overlap, but some labels may still be too close.');
-        return best;
-    }
-    const msg = res.validation.violations.map(v => `${v.rule}: ${v.message}`).join('; ');
-    throw new Error(`Layout could not be made overlap-free: ${msg || 'band overflow'}`);
-}
 
     // Generate Sankey frames by year and scenario
-    function generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
-        let filteredData;
-        if (selectedDiagram === 'Energy') {
-            // Indexed lookup: only the selected states' rows for this scenario
-            // (L0 file + active detail file, all row levels incl. level 4 for High).
-            const matchingRows = collectEnergyRows(data, selectedSSP, selectedRCP, currentSelectedStates);
+    function generateSankeyFrames(data, selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
+        const nodeTable = data.nodeTable;
+        // Indexed lookup: only the selected states' rows for this scenario and level.
+        const matchingRows = collectRows(data, selectedSSP, selectedRCP, currentSelectedStates);
 
-            // Sum flows across multiple selected states.
-            // Node colors come from the nodes parquet. In 'data' mode, edges are
-            // additionally split by their parquet color so each fuel keeps its own band.
-            const splitByColor = selectedColorPalette === 'data';
-            const aggregatedMap = new Map();
-            matchingRows.forEach(row => {
-                const key = splitByColor
-                    ? `${row.year}|||${row.source}|||${row.target}|||${row.color}`
-                    : `${row.year}|||${row.source}|||${row.target}`;
-                const val = parseFloat(row.value) || 0;
-                if (!aggregatedMap.has(key)) {
-                    aggregatedMap.set(key, {
-                        year: row.year,
-                        source: row.source,
-                        target: row.target,
-                        source_color: energyNodeTable?.get(row.source)?.color ?? null,
-                        target_color: energyNodeTable?.get(row.target)?.color ?? null,
-                        link_color: splitByColor ? (row.color ?? null) : null,
-                        source_key: splitByColor ? (row.source_key ?? null) : null,
-                        source_position: row.source_position,
-                        target_position: row.target_position,
-                        value: val,
-                        units: row.units
-                    });
-                } else {
-                    const existing = aggregatedMap.get(key);
-                    existing.value += val;
-                }
-            });
-            filteredData = Array.from(aggregatedMap.values());
-        } else {
-            const selectedUnitsList = [selectedEnergyUnits, selectedWaterUnits];
-            filteredData = data.filter(row => (row.ssp === selectedSSP) && (row.rcp === selectedRCP) && (row.climate_sensitivity === selectedClimate) && (row.diagram === selectedDiagram) && (selectedUnitsList.includes(row.units)));
-        }
+        // Nodes missing from the node table (water-only names in the water diagram)
+        // take the colour of their outflows, else of their inflows.
+        const fallbackColor = new Map();
+        for (const row of matchingRows) if (!fallbackColor.has(row.source)) fallbackColor.set(row.source, row.color);
+        for (const row of matchingRows) if (!fallbackColor.has(row.target)) fallbackColor.set(row.target, row.color);
+        const nodeColor = l => nodeTable?.get(l)?.color ?? fallbackColor.get(l) ?? null;
+
+        const factor = { Energy: UNIT_FACTORS[selectedEnergyUnits], Water: UNIT_FACTORS[selectedWaterUnits] };
+        const unitsOf = { Energy: selectedEnergyUnits, Water: selectedWaterUnits };
+
+        // Sum flows across multiple selected states.
+        // In 'data' mode, edges are additionally split by their parquet color so each
+        // fuel keeps its own band.
+        const splitByColor = selectedColorPalette === 'data';
+        const aggregatedMap = new Map();
+        matchingRows.forEach(row => {
+            const key = splitByColor
+                ? `${row.year}|||${row.source}|||${row.target}|||${row.color}`
+                : `${row.year}|||${row.source}|||${row.target}`;
+            const val = (parseFloat(row.value) || 0) * factor[row.diagram];
+            if (!aggregatedMap.has(key)) {
+                aggregatedMap.set(key, {
+                    year: row.year,
+                    source: row.source,
+                    target: row.target,
+                    kind: row.diagram,
+                    source_color: nodeColor(row.source),
+                    target_color: nodeColor(row.target),
+                    link_color: splitByColor ? (row.color ?? null) : null,
+                    source_key: splitByColor ? (row.source_key ?? null) : null,
+                    source_position: row.source_position,
+                    target_position: row.target_position,
+                    value: val,
+                    units: unitsOf[row.diagram]
+                });
+            } else {
+                const existing = aggregatedMap.get(key);
+                existing.value += val;
+            }
+        });
+        const filteredData = Array.from(aggregatedMap.values());
 
         const years = [...new Set(filteredData.map(row => row.year))].sort((a, b) => a - b);
         const labels = new Set();
@@ -544,10 +504,9 @@
         filteredData.forEach(row => {
             labels.add(row.source);
             labels.add(row.target);
-            const ej = String(row.units ?? '').trim() === 'EJ';
-            const water = !ej && isWaterUnit(row.units);
-            markNode(row.source, ej, water);
-            markNode(row.target, ej, water);
+            const ej = row.kind === 'Energy';
+            markNode(row.source, ej, !ej);
+            markNode(row.target, ej, !ej);
             if (Number(row.value) > 0) {
                 let list = rowsByYear.get(row.year);
                 if (!list) rowsByYear.set(row.year, (list = []));
@@ -560,11 +519,11 @@
         let labelsArray;
         try {
             const tLayout = performance.now();
+            const layoutOpts = { padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX };
             const layoutRes = selectedDiagram === 'Energy'
-                ? computeEnergyLayout([...labels], filteredData, energyNodeTable, currentDetailLevel,
-                    { padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX })
-                : computeNodePositions([...labels], filteredData,
-                    { strict: false, padPx: NODE_PAD_PX, plotHeightPx: PLOT_HEIGHT_PX });
+                ? computeEnergyLayout([...labels], filteredData, nodeTable, currentDetailLevel, layoutOpts)
+                : computeWaterLayout([...labels], filteredData,
+                    selectedDiagram === 'Water' ? null : nodeTable, currentDetailLevel, layoutOpts);
             layoutWarnings = layoutRes.warnings ?? [];
             labelsArray = layoutRes.labels; // Use the canonical deterministically sorted label order!
             nodeX = layoutRes.x;
@@ -592,12 +551,6 @@
             const used = new Set(yearData.flatMap(row => [row.source, row.target]));
             const frameLabels = labelsArray.filter(l => used.has(l));
             const idx = new Map(frameLabels.map((l, i) => [l, i]));
-            const frameLayout = selectedDiagram !== 'Energy'
-                ? computeWaterFrameLayout(frameLabels, yearData)
-                : null;
-            const frameXY = frameLayout
-                ? new Map(frameLayout.labels.map((l, i) => [l, { x: frameLayout.x[i], y: frameLayout.y[i] }]))
-                : null;
 
             const sources = [];
             const targets = [];
@@ -612,9 +565,7 @@
             };
             const nodeColors = selectedColorPalette === 'energy-water'
                 ? frameLabels.map(l => pos.get(l).c)
-                : frameLabels.map(l =>
-                    (selectedDiagram === 'Energy' ? energyNodeTable?.get(l)?.color : null) ?? null
-                );
+                : frameLabels.map(l => nodeColor(l));
 
             yearData.forEach(row => {
                 const sIdx = idx.get(row.source);
@@ -623,13 +574,12 @@
                 targets.push(tIdx);
                 values.push(parseFloat(row.value));
                 linkColors.push(getLinkColor(row, selectedColorPalette));
-                if (selectedColorPalette === 'interpolated' ||
-                    (selectedColorPalette === 'data' && selectedDiagram !== 'Energy')) {
+                if (selectedColorPalette === 'interpolated') {
                     if (row.source_color) nodeColors[sIdx] = row.source_color;
                     if (row.target_color) nodeColors[tIdx] = row.target_color;
                 }
                 const v = displayValue(row);
-                const units = row.units || 'EJ';
+                const units = row.units;
                 flowHoverLabels.push({
                     value: formatWithUnits(v, units),
                     fuel: escapeHtml(row.source_key ?? '')
@@ -653,15 +603,15 @@
                     valueformat: '.3r',
                     orientation: "h",
                     node: {
-                        pad: frameLayout ? frameLayout.padPx : NODE_PAD_PX,
+                        pad: NODE_PAD_PX,
                         thickness: 20,
                         line: { color: "black", width: 0.5 },
                         label: frameLabels,
                         customdata: nodeHover,
                         hovertemplate: "<b>%{label}</b><br>%{customdata}<extra></extra>",
                         color: nodeColors,
-                        x: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).x),
-                        y: frameLabels.map(l => (frameXY ? frameXY.get(l) : pos.get(l)).y)
+                        x: frameLabels.map(l => pos.get(l).x),
+                        y: frameLabels.map(l => pos.get(l).y)
                     },
                     link: {
                         source: sources,
@@ -680,18 +630,11 @@
         return { frames, labels: labelsArray };
     }
 
-    async function loadParquetLevel(levelKey) {
-        if (energyLevelDataCache[levelKey]) {
-            return energyLevelDataCache[levelKey];
-        }
+    async function loadParquetFile(fileName) {
+        if (fileCache[fileName]) return fileCache[fileName];
+        if (pendingFiles[fileName]) return pendingFiles[fileName];
 
-        if (pendingLevelPromises[levelKey]) {
-            return pendingLevelPromises[levelKey];
-        }
-
-        const fileName = `gcam_usa_energy_l${levelKey}.parquet`;
-
-        pendingLevelPromises[levelKey] = (async () => {
+        pendingFiles[fileName] = (async () => {
             const tFetch = performance.now();
             const response = await fetch(`${base}/${fileName}`);
 
@@ -706,7 +649,7 @@
             const tParse = performance.now();
             const metadata = parquetMetadata(arrayBuffer);
             const available = new Set(metadata.schema.slice(1).map(s => s.name));
-            const columns = ENERGY_COLUMNS.filter(c => available.has(c));
+            const columns = PARQUET_COLUMNS.filter(c => available.has(c));
             let parsedRows = [];
 
             await parquetRead({
@@ -721,20 +664,24 @@
             logTiming(`parse ${fileName} (${parsedRows.length} rows)`, tParse);
 
             const tIndex = performance.now();
-            const levelIndex = buildEnergyIndex(parsedRows);
-            logTiming(`index ${fileName} (${levelIndex.rowCount} rows kept)`, tIndex);
+            const fileIndex = buildRowIndex(parsedRows);
+            logTiming(`index ${fileName} (${fileIndex.rowCount} rows kept)`, tIndex);
 
-            energyLevelDataCache = {
-                ...energyLevelDataCache,
-                [levelKey]: levelIndex
-            };
-
-            return levelIndex;
+            fileCache = { ...fileCache, [fileName]: fileIndex };
+            return fileIndex;
         })().finally(() => {
-            delete pendingLevelPromises[levelKey];
+            delete pendingFiles[fileName];
         });
 
-        return pendingLevelPromises[levelKey];
+        return pendingFiles[fileName];
+    }
+
+    async function loadNodeTable(fileName) {
+        if (!nodeTableCache[fileName]) {
+            const rows = await fetchParquet(fileName);
+            nodeTableCache = { ...nodeTableCache, [fileName]: buildNodeTable(rows) };
+        }
+        return nodeTableCache[fileName];
     }
 
     /**
@@ -742,7 +689,7 @@
      * Rows are kept by reference (no object copies). All row levels are kept
      * (e.g. l3.parquet contains level 3 and level 4 rows; both are needed for High).
      */
-    function buildEnergyIndex(rows) {
+    function buildRowIndex(rows) {
         const index = new Map();
         const hotterCache = new Map();
         const keyCache = new Map();
@@ -766,8 +713,9 @@
                 r.rcp = r.rcp ?? (s.match(rcpRegex)?.[0] ?? null);
             }
             if (typeof r.year === 'bigint') r.year = Number(r.year);
-            if (r.units == null) r.units = 'EJ';
+            if (typeof r.level === 'bigint') r.level = Number(r.level);
             if (r.diagram == null) r.diagram = 'Energy';
+            if (r.units == null) r.units = r.diagram === 'Water' ? 'km^3' : 'EJ';
 
             const rawKey = `${r.ssp}|${r.rcp}`;
             let key = keyCache.get(rawKey);
@@ -787,55 +735,65 @@
         return { index, rowCount };
     }
 
-    /** Active energy dataset = L0 index + the selected detail-level index. */
-    function makeEnergyData(detailLevel) {
+    function datasetKey(diagram, level) {
+        return `${diagram}|${level}`;
+    }
+
+    /** Active dataset = the indexed files for one diagram and level of detail. */
+    function makeDataset(diagram, level) {
+        const files = datasetFiles(diagram, level);
+        if (files.some(f => !fileCache[f.file]) || !nodeTableCache[NODE_TABLE_FILE[diagram]]) return null;
         return {
-            detailLevel: String(detailLevel),
-            levels: [energyLevelDataCache['0'], energyLevelDataCache[String(detailLevel)]].filter(Boolean)
+            key: datasetKey(diagram, level),
+            nodeTable: nodeTableCache[NODE_TABLE_FILE[diagram]],
+            levels: files.map(f => ({ index: fileCache[f.file].index, level: f.level ?? null }))
         };
     }
 
     /** Rows for the selected scenario + states only (no full-dataset scan). */
-    function collectEnergyRows(energyData, ssp, rcp, states) {
+    function collectRows(dataset, ssp, rcp, states) {
         const key = `${ssp}|${rcp}`.toLowerCase();
         const out = [];
-        for (const lvl of energyData?.levels ?? []) {
+        for (const lvl of dataset?.levels ?? []) {
             const byRegion = lvl.index.get(key);
             if (!byRegion) continue;
             for (const state of states) {
                 const list = byRegion.get(state);
                 if (!list) continue;
-                for (let i = 0; i < list.length; i++) out.push(list[i]);
+                for (let i = 0; i < list.length; i++) {
+                    if (lvl.level == null || list[i].level === lvl.level) out.push(list[i]);
+                }
             }
         }
         return out;
     }
 
-    /** After the first Energy render, quietly load the other detail levels in idle time. */
-    function schedulePrefetchOtherLevels() {
-        if (prefetchScheduled || typeof window === 'undefined') return;
-        prefetchScheduled = true;
+    /** After the first render of a diagram, quietly load its other detail levels in idle time. */
+    function schedulePrefetchOtherLevels(diagram) {
+        if (prefetched.has(diagram) || typeof window === 'undefined') return;
+        prefetched.add(diagram);
         const idle = window.requestIdleCallback
             ? (cb) => window.requestIdleCallback(cb, { timeout: 5000 })
             : (cb) => setTimeout(cb, 1500);
         const run = async () => {
             for (const { value } of detailLevels) {
-                if (energyLevelDataCache[value] || pendingLevelPromises[value]) continue;
-                try {
-                    await loadParquetLevel(value);
-                } catch (err) {
-                    console.warn(`Prefetch of energy level ${value} failed:`, err);
+                for (const { file } of datasetFiles(diagram, value)) {
+                    if (fileCache[file] || pendingFiles[file]) continue;
+                    try {
+                        await loadParquetFile(file);
+                    } catch (err) {
+                        console.warn(`Prefetch of ${file} failed:`, err);
+                    }
+                    await new Promise(resolve => idle(resolve));
                 }
-                await new Promise(resolve => idle(resolve));
             }
         };
         idle(run);
     }
 
-    function renderCacheKey(selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
-        return selectedDiagram === 'Energy'
-            ? ['E', currentDetailLevel, selectedSSP, selectedRCP, [...currentSelectedStates].sort().join(','), selectedColorPalette].join('|')
-            : ['W', selectedDiagram, selectedSSP, selectedRCP, selectedClimate, selectedEnergyUnits, selectedWaterUnits, selectedColorPalette].join('|');
+    function renderCacheKey(selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
+        return [selectedDiagram, currentDetailLevel, selectedSSP, selectedRCP, [...currentSelectedStates].sort().join(','),
+            selectedEnergyUnits, selectedWaterUnits, selectedColorPalette].join('|');
     }
 
     function scheduleRender(args) {
@@ -846,36 +804,30 @@
         }, RENDER_DEBOUNCE_MS);
     }
 
-    async function loadGcamEnergyForDetailLevel(detailLevel) {
-        const requiredLevels = ['0', String(detailLevel)];
-        const needsFetch = !energyNodeTable || requiredLevels.some(lvl => !energyLevelDataCache[lvl]);
-
-        if (needsFetch) {
-            isLoadingEnergyData = true;
+    async function loadDataset(diagram, level) {
+        const files = datasetFiles(diagram, level).map(f => f.file);
+        const nodeFile = NODE_TABLE_FILE[diagram];
+        if (files.some(f => !fileCache[f]) || !nodeTableCache[nodeFile]) {
+            isLoadingData = true;
         }
 
         try {
-            await Promise.all([
-                ...requiredLevels.map(lvl => loadParquetLevel(lvl)),
-                energyNodeTable
-                    ? null
-                    : fetchParquet('gcam_usa_energy_nodes.parquet').then(rows => { energyNodeTable = buildNodeTable(rows); })
-            ]);
-
-            // Level 0 plus the active detail level (indexed, no array concatenation)
-            gcamEnergyData = makeEnergyData(detailLevel);
-            loadedDetailLevel = String(detailLevel);
+            await Promise.all([...files.map(loadParquetFile), loadNodeTable(nodeFile)]);
         } catch (error) {
-            console.error('Error loading split GCAM energy parquet files:', error);
+            console.error(`Error loading ${diagram} parquet files:`, error);
         } finally {
-            isLoadingEnergyData = false;
+            isLoadingData = false;
+        }
+        // Only publish if the selection has not moved on while loading.
+        if (diagram === selectedDiagram && String(level) === String(selectedDetailLevel)) {
+            activeData = makeDataset(diagram, level);
         }
     }
 
     // Energy-water Sankey
-    function initializeHybridSankey(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
+    function initializeHybridSankey(data, selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette) {
         const tRender = performance.now();
-        const cacheKey = renderCacheKey(selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
+        const cacheKey = renderCacheKey(selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
         let cached = frameCache.get(cacheKey);
         if (cached) {
             // LRU touch + restore side-effect state produced by generateSankeyFrames
@@ -884,7 +836,7 @@
             layoutWarnings = cached.warnings;
             layoutErrorMessage = '';
         } else {
-            const result = generateSankeyFrames(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
+            const result = generateSankeyFrames(data, selectedSSP, selectedRCP, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel, selectedColorPalette);
             cached = { ...result, warnings: layoutWarnings };
             if (result.frames && result.frames.length > 0) {
                 frameCache.set(cacheKey, cached);
@@ -916,13 +868,18 @@
         const CONTROLS_Y = -0.01;  // paper units below the plot
         const MARGIN_B = 70;
 
+        const regionName = currentSelectedStates.length === 1 ? currentSelectedStates[0] : 'Selected Region';
+        const unitsNote = selectedDiagram === 'Energy'
+            ? energyUnitMapping[selectedEnergyUnits]
+            : selectedDiagram === 'Water'
+                ? waterUnitMapping[selectedWaterUnits]
+                : `energy in ${energyUnitMapping[selectedEnergyUnits]}, water in ${waterUnitMapping[selectedWaterUnits]}`;
+
         const layout = {
             autosize: true,
             height: PLOT_HEIGHT_PX + 100 + MARGIN_B,
             margin: { t: 100, b: MARGIN_B, l: 20, r: 20 },
-            title: selectedDiagram === 'Energy' 
-                ? `Energy Sankey Diagram for ${currentSelectedStates.length === 1 ? currentSelectedStates[0] : 'Selected Region'}` 
-                : `${diagramMapping[selectedDiagram]} Sankey Diagram for the United States`,
+            title: `${diagramMapping[selectedDiagram]} Sankey Diagram for ${regionName}`,
             font: { size: 14 },
             sliders: [{
                 steps: frames.map(frame => ({
@@ -981,9 +938,7 @@
             }],
             annotations: [
                 {
-                    text: selectedDiagram === 'Energy'
-                        ? `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]} | States: ${stateLabel} | Level of Detail: ${detailName}`
-                        : `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]}`,
+                    text: `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]} | States: ${stateLabel} | Level of Detail: ${detailName}<br>Units: ${unitsNote}`,
                     x: 0.5,
                     y: 1.05,
                     xref: "paper",
@@ -1013,8 +968,8 @@
         })
             .then(() => {
                 logTiming('Plotly.react', tPlotly);
-                if (thisRender === renderCounter && selectedDiagram === 'Energy') {
-                    schedulePrefetchOtherLevels();
+                if (thisRender === renderCounter) {
+                    schedulePrefetchOtherLevels(selectedDiagram);
                 }
                 if (thisRender === renderCounter) {
                     if (targetElement.on && !targetElement._hasSliderChangeListener) {
@@ -1052,62 +1007,26 @@
             });
     }
 
-    onMount(() => {
-        fetch(`${base}/energy_water_data.csv`).then(response => {
-            if (!response.ok) throw new Error("Network response was not ok");
-            return response.text();
-        }).then(
-            d => Papa.parse(d, { header: true }).data
-        ).then(d => {
-            energywaterdata = d;
-        }).catch(
-            error => console.error("Error loading CSV file:", error)
-        );
-    });
-
-    $: activeData = selectedDiagram === 'Energy' ? gcamEnergyData : energywaterdata;
-
-    $: if (selectedDiagram === 'Energy') {
-        const hasL0 = Boolean(energyLevelDataCache['0']);
-        const hasDetail = Boolean(energyLevelDataCache[String(selectedDetailLevel)]);
-        const hasNodeTable = Boolean(energyNodeTable);
-
-        if (!hasL0 || !hasDetail || !hasNodeTable) {
-            loadGcamEnergyForDetailLevel(selectedDetailLevel);
-        } else if (loadedDetailLevel !== String(selectedDetailLevel)) {
-            gcamEnergyData = makeEnergyData(selectedDetailLevel);
-            loadedDetailLevel = String(selectedDetailLevel);
-        }
+    // Load (or switch to) the files for the selected diagram and level of detail.
+    $: if (browser && activeData?.key !== datasetKey(selectedDiagram, selectedDetailLevel)) {
+        activeData = makeDataset(selectedDiagram, selectedDetailLevel);
+        if (!activeData) loadDataset(selectedDiagram, selectedDetailLevel);
     }
 
     $: if (
         activeData &&
-        (
-            selectedDiagram === 'Energy'
-                ? (
-                    energyNodeTable &&
-                    selectedStates.length > 0 &&
-                    selectedSSP &&
-                    selectedRCP &&
-                    selectedDetailLevel &&
-                    loadedDetailLevel === String(selectedDetailLevel)
-                )
-                : (
-                    selectedSSP &&
-                    selectedRCP &&
-                    selectedClimate &&
-                    selectedDiagram &&
-                    selectedEnergyUnits &&
-                    selectedWaterUnits
-                )
-        )
+        activeData.key === datasetKey(selectedDiagram, selectedDetailLevel) &&
+        selectedStates.length > 0 &&
+        selectedSSP &&
+        selectedRCP &&
+        selectedEnergyUnits &&
+        selectedWaterUnits
     ) {
         // Debounced: rapid shift-clicks / option changes coalesce into one render.
         const renderArgs = [
             activeData,
             selectedSSP,
             selectedRCP,
-            selectedClimate,
             selectedDiagram,
             selectedEnergyUnits,
             selectedWaterUnits,
@@ -1118,24 +1037,16 @@
         scheduleRender(renderArgs);
     }
 
-    function downloadCSV(data, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates, currentDetailLevel) {
+    function downloadCSV(data, selectedSSP, selectedRCP, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates) {
         if (!data) return;
-        
-        let filteredData;
-        let columnsToDownload;
 
-        if (selectedDiagram === 'Energy') {
-            // `data` holds only the L0 file + the active detail-level file
-            // (e.g. High = l3.parquet, which holds both level 3 and level 4 rows), so do
-            // not filter on row.level here — that previously dropped level-4 rows.
-            filteredData = collectEnergyRows(data, selectedSSP, selectedRCP, currentSelectedStates);
-            columnsToDownload = ["rcp", "ssp", "region", "year", "source", "target", "level", "units", "diagram", "value"];
-        } else {
-            if (!data.length) return;
-            const selectedUnitsList = [selectedEnergyUnits, selectedWaterUnits];
-            filteredData = data.filter(row => (row.ssp === selectedSSP) && (row.rcp === selectedRCP) && (row.climate_sensitivity === selectedClimate) && (row.diagram === selectedDiagram) && (selectedUnitsList.includes(row.units)));
-            columnsToDownload = ["rcp", 'ssp', "source", "target", "year", "unit_value", "units", "diagram"];
-        }
+        // `data` holds only the files for the active diagram and level of detail
+        // (e.g. High energy = l3.parquet, which holds both level 3 and level 4 rows).
+        const factor = { Energy: UNIT_FACTORS[selectedEnergyUnits], Water: UNIT_FACTORS[selectedWaterUnits] };
+        const unitsOf = { Energy: selectedEnergyUnits, Water: selectedWaterUnits };
+        const filteredData = collectRows(data, selectedSSP, selectedRCP, currentSelectedStates)
+            .map(r => ({ ...r, value: Number(r.value) * factor[r.diagram], units: unitsOf[r.diagram] }));
+        const columnsToDownload = ["rcp", "ssp", "region", "year", "source", "target", "level", "units", "diagram", "value"];
 
         const columnNames = { rcp: 'future_weather', ssp: 'population_gdp_growth' };
         const valueMaps = { rcp: rcpMapping, ssp: sspMapping };
@@ -1173,8 +1084,7 @@
         </div>
     </div>
     
-    {#if selectedDiagram === 'Energy'}
-        <div class="flex flex-col gap-2 mb-4 font-sans text-base font-normal text-blue-gray-700">
+    <div class="flex flex-col gap-2 mb-4 font-sans text-base font-normal text-blue-gray-700">
             <div class="flex items-center justify-between">
                 <span class="font-semibold text-sm text-gray-700">Select States ({selectedStates.length}):</span>
                 <div class="flex gap-2 text-xs">
@@ -1216,7 +1126,6 @@
                 {/each}
             </div>
         </div>
-    {/if}
 
     <nav class="flex min-w-[240px] flex-col gap-3 mb-2 font-sans text-base font-normal text-blue-gray-700">
         <div role="contentinfo"
@@ -1414,7 +1323,7 @@
                 <span>Reset Layout</span>
             </button>
 
-            <button on:click={() => downloadCSV(activeData, selectedSSP, selectedRCP, selectedClimate, selectedDiagram, selectedEnergyUnits, selectedWaterUnits, selectedStates, selectedDetailLevel)} class="bg-gray-200 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded inline-flex items-center">
+            <button on:click={() => downloadCSV(activeData, selectedSSP, selectedRCP, selectedEnergyUnits, selectedWaterUnits, selectedStates)} class="bg-gray-200 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded inline-flex items-center">
                 <svg class="fill-current w-4 h-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M13 8V2H7v6H2l8 8 8-8h-5zM0 18h20v2H0v-2z"/></svg>
                 <span>Download Selected Data</span>
             </button>
@@ -1434,13 +1343,13 @@
                     Retry Default Layout
                 </button>
             </div>
-        {:else if isLoadingEnergyData}
+        {:else if isLoadingData}
             <div class="flex items-center justify-center min-h-[800px]">
-                <p class="text-xl text-gray-600">Loading Energy data...</p>
+                <p class="text-xl text-gray-600">Loading {diagramMapping[selectedDiagram]} data...</p>
             </div>
         {/if}
         <div id="hybridSankeyDiagram"
      class="w-full min-h-[800px] m-0 p-0"
-     class:invisible={isLoadingEnergyData || layoutErrorMessage}></div>    </div>
+     class:invisible={isLoadingData || layoutErrorMessage}></div>    </div>
 
 </div>
