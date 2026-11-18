@@ -3,6 +3,7 @@
     import { parquetRead, parquetMetadata } from 'hyparquet';
     import { base } from '$app/paths';
     import { browser } from '$app/environment';
+    import { afterNavigate, replaceState } from '$app/navigation';
     import Icon from "@iconify/svelte";
     import { slide } from 'svelte/transition';
     import { computeEnergyLayout, computeWaterLayout } from './energyLayout.js';
@@ -232,6 +233,68 @@
     };
 
     let selectedColorPalette = 'data';
+
+    // ---- Shareable links ----
+    // Every selection is mirrored into the query string so a URL reproduces the view.
+    // Values read from a URL are checked against the allowed options; anything unknown
+    // is ignored and the default stays.
+    const allStates = stateGrid.flat().filter(Boolean);
+    const diagramParam = { 'Energy & Water': 'energy-water', 'Energy': 'energy', 'Water': 'water' };
+    const diagramFromParam = Object.fromEntries(Object.entries(diagramParam).map(([k, v]) => [v, k]));
+
+    function pick(value, allowed) {
+        return allowed.includes(value) ? value : null;
+    }
+
+    function readUrlState() {
+        const q = new URLSearchParams(window.location.search);
+        selectedDiagram = diagramFromParam[q.get('diagram')] ?? selectedDiagram;
+        selectedSSP = pick(q.get('ssp'), ssps) ?? selectedSSP;
+        selectedRCP = pick(q.get('rcp'), rcps) ?? selectedRCP;
+        selectedDetailLevel = pick(q.get('detail'), detailLevels.map(d => d.value)) ?? selectedDetailLevel;
+        selectedColorPalette = pick(q.get('palette'), colorPalettes.map(p => p.value)) ?? selectedColorPalette;
+        selectedEnergyUnits = pick(q.get('energy_units'), energy_units) ?? selectedEnergyUnits;
+        selectedWaterUnits = pick(q.get('water_units'), water_units) ?? selectedWaterUnits;
+        const states = (q.get('states') ?? '').toUpperCase().split(',').filter(s => allStates.includes(s));
+        if (states.length > 0) selectedStates = [...new Set(states)];
+        const year = Number(q.get('year'));
+        if (Number.isInteger(year) && year > 0) currentSelectedYear = year;
+    }
+
+    function buildShareUrl(diagram, ssp, rcp, states, detail, palette, energyUnits, waterUnits, year) {
+        const url = new URL(window.location.href);
+        const q = new URLSearchParams({
+            diagram: diagramParam[diagram], ssp, rcp,
+            states: states.join(','), detail, palette,
+            energy_units: energyUnits, water_units: waterUnits
+        });
+        if (year != null) q.set('year', String(year));
+        url.search = q.toString();
+        return url;
+    }
+
+    // replaceState needs the SvelteKit router fully started, which is only guaranteed
+    // once the initial navigation has completed (onMount can run before that).
+    let routerReady = false;
+    if (browser) readUrlState();
+    afterNavigate(() => { routerReady = true; });
+
+    $: if (browser && routerReady) {
+        const url = buildShareUrl(selectedDiagram, selectedSSP, selectedRCP, selectedStates, selectedDetailLevel,
+            selectedColorPalette, selectedEnergyUnits, selectedWaterUnits, currentSelectedYear);
+        if (url.href !== window.location.href) replaceState(url, {});
+    }
+
+    let linkCopied = false;
+    async function copyShareLink() {
+        try {
+            await navigator.clipboard.writeText(window.location.href);
+            linkCopied = true;
+            setTimeout(() => { linkCopied = false; }, 2000);
+        } catch (err) {
+            console.error('Copy link failed:', err);
+        }
+    }
 
     // Collapsible Visualization Options sections (collapsed by default)
     let expandedSections = { palette: false, flows: false, waterUnits: false, energyUnits: false };
@@ -956,6 +1019,7 @@
         const thisRender = ++renderCounter;
         const targetElement = document.getElementById("hybridSankeyDiagram");
         if (!targetElement) return;
+        lastFigure = { frames, layout, title: layout.title, regionName };
 
         // One call with frames included: replaces old frames (no accumulation) and avoids a
         // second pass through Plotly.addFrames.
@@ -978,6 +1042,11 @@
                             if (e && e.step && e.step.label != null) {
                                 currentSelectedYear = e.step.label;
                             }
+                        });
+                        // Track the year while playing, so option changes, shared links and
+                        // image exports use the year on screen.
+                        targetElement.on('plotly_animatingframe', e => {
+                            if (e && e.name != null) currentSelectedYear = e.name;
                         });
                     }
 
@@ -1035,6 +1104,50 @@
             selectedColorPalette
         ];
         scheduleRender(renderArgs);
+    }
+
+    // ---- Image export ----
+    // Exports the frame for the year on screen, without the slider and play button,
+    // and with the year in the title so the image stands on its own.
+    let lastFigure = null;
+    let isExporting = false;
+
+    async function downloadImage(format) {
+        const el = document.getElementById('hybridSankeyDiagram');
+        if (!lastFigure || !el || isExporting) return;
+        const { frames, layout, title, regionName } = lastFigure;
+        const frame = frames.find(f => String(f.name) === String(currentSelectedYear)) ?? frames[0];
+        const width = el.clientWidth || 1200;
+        const height = PLOT_HEIGHT_PX + 130;
+        const figure = {
+            data: frame.data,
+            layout: {
+                ...layout,
+                title: `${title}, ${frame.name}`,
+                sliders: [],
+                updatemenus: [],
+                margin: { ...layout.margin, b: 30 },
+                height,
+                width,
+                paper_bgcolor: 'white'
+            }
+        };
+        const scenario = `${rcpShortName[selectedRCP]}_${sspShortName[selectedSSP]}`;
+        const filename = ['VIEWS', diagramParam[selectedDiagram], regionName.replace(/\s+/g, '-'), scenario, frame.name].join('_');
+        isExporting = true;
+        try {
+            const dataUrl = await Plotly.toImage(figure, { format, width, height, scale: format === 'png' ? 2 : 1 });
+            const link = document.createElement('a');
+            link.href = dataUrl;
+            link.download = `${filename}.${format}`;
+            document.body.appendChild(link);
+            link.click();
+            document.body.removeChild(link);
+        } catch (err) {
+            console.error('Image export failed:', err);
+        } finally {
+            isExporting = false;
+        }
     }
 
     function downloadCSV(data, selectedSSP, selectedRCP, selectedEnergyUnits, selectedWaterUnits, currentSelectedStates) {
@@ -1326,6 +1439,22 @@
             <button on:click={() => downloadCSV(activeData, selectedSSP, selectedRCP, selectedEnergyUnits, selectedWaterUnits, selectedStates)} class="bg-gray-200 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded inline-flex items-center">
                 <svg class="fill-current w-4 h-4 mr-2" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20"><path d="M13 8V2H7v6H2l8 8 8-8h-5zM0 18h20v2H0v-2z"/></svg>
                 <span>Download Selected Data</span>
+            </button>
+
+            <div class="grid grid-cols-2 gap-2">
+                <button on:click={() => downloadImage('png')} disabled={!lastFigure || isExporting} type="button" title="Download the diagram for the year shown as a PNG image" class="bg-white hover:bg-gray-100 text-gray-800 border border-gray-300 font-semibold py-2 px-3 rounded inline-flex items-center justify-center disabled:opacity-50">
+                    <Icon icon="tabler:photo-down" class="mr-2 text-lg" />
+                    <span>PNG</span>
+                </button>
+                <button on:click={() => downloadImage('svg')} disabled={!lastFigure || isExporting} type="button" title="Download the diagram for the year shown as an SVG (vector) image" class="bg-white hover:bg-gray-100 text-gray-800 border border-gray-300 font-semibold py-2 px-3 rounded inline-flex items-center justify-center disabled:opacity-50">
+                    <Icon icon="tabler:vector" class="mr-2 text-lg" />
+                    <span>SVG</span>
+                </button>
+            </div>
+
+            <button on:click={copyShareLink} type="button" title="Copy a link that reopens the dashboard with these selections" class="bg-white hover:bg-gray-100 text-gray-800 border border-gray-300 font-semibold py-2 px-4 rounded inline-flex items-center justify-center">
+                <Icon icon={linkCopied ? 'tabler:check' : 'tabler:link'} class="mr-2 text-lg" />
+                <span>{linkCopied ? 'Link copied' : 'Copy Link to This View'}</span>
             </button>
         </div>
     </nav>

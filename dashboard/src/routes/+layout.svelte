@@ -26,7 +26,7 @@
 	<div class="flex w-screen items-center justify-center gap-2 bg-amber-100 py-1 text-sm text-amber-900 border-b border-amber-300">
 		<Icon icon="tabler:flask" />
 		<span>Preview build of the <strong>develop</strong> branch{commitSha ? ` (${commitSha})` : ''}. Results may change.</span>
-		<a href="/VIEWS/" class="underline hover:text-amber-700">Go to the released dashboard</a>
+		<a href="https://pnnl.github.io/VIEWS/" class="underline hover:text-amber-700">Go to the released dashboard</a>
 	</div>
 {/if}
 
@@ -41,7 +41,7 @@
 
 	{#each page_items as item}
 	<a href="{base}/{item === 'sankeys' ? '' : item}" class="hover:text-[#2B7F9E] hover:scale-105">{item.toUpperCase()}</a>
-	
+	{/each}
 </div>
 
 <div class="flex flex-row w-screen h-[20px] pl-8  bg-white gap-8">	
