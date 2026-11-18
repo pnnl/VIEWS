@@ -6,15 +6,18 @@
   let fullScreenCaption = '';
   
 
-  const scenarioResources = [
-    {
-      src: 'im3_scenarios.png',
-      alt: 'IM3 Scenarios Design',
-      title: 'IM3 Scenarios Design',
-      // caption: 'GCAM market-based structure, sectors, interactions, and typical inputs and outputs',
-      tooltip: 'Click to enlarge the diagram.'
-    },
+  const scenarioTable = [
+    { name: 'ModHotDry_LowPopGDP', emissions: 'Moderate', weather: 'Moderately', population: 'Low' },
+    { name: 'ModHotDry_HighPopGDP', emissions: 'Moderate', weather: 'Moderately', population: 'High' },
+    { name: 'SevHotDry_LowPopGDP', emissions: 'None', weather: 'Severely', population: 'Low' },
+    { name: 'SevHotDry_HighPopGDP', emissions: 'None', weather: 'Severely', population: 'High' },
   ];
+
+  const experimentDiagram = {
+    src: 'im3_exp_modeling_diagram.png',
+    alt: 'GCAM-USA IM3 Experiment Diagram',
+    title: 'GCAM-USA IM3 Experiment'
+  };
 
   const diagramsResources = [
     {
@@ -23,13 +26,6 @@
       title: 'Global Change Analysis Model (GCAM)',
       // caption: 'GCAM market-based structure, sectors, interactions, and typical inputs and outputs',
       tooltip: 'Click to enlarge the GCAM diagram.'
-    },
-    {
-      src: 'experiment.svg',
-      alt: 'GCAM-USA IM3 Experiment Diagram',
-      title: 'GCAM-USA IM3 Experiment',
-      // caption: 'GCAM-USA IM3 experimental design',
-      tooltip: 'Click to enlarge the GCAM-USA IM3 experiment diagram'
     },
 
     // {
@@ -137,54 +133,58 @@
     <br>
 
     <h2 class="mb-7 text-slate-800 text-2xl font-semibold">
-      Scenario Design 
+      Scenario Design
     </h2>
     <hr class="border-1 border-gray-300">
     <br>
 
-    <p> The eight scenarios defined below were developed for the Integrated Multisector, Multiscale Modeling (IM3) project (DOE SC).  The U.S.-scale Sankey diagrams shown in this dashboard show results from IM3 simulations for each of these scenarios using a customized version of the GCAM-USA model. GCAM-USA is an economic equilibrium model that simulates markets for energy, water, and land, as well as the interactions between those markets. In IM3, GCAM-USA incorporates climate impacts on energy demand, surface water supply, and agricultural yields, including greenhouse gas emissions trends consistent with each climate scenario, and socioeconomic impacts on population and economic growth. In summary, the IM3 scenarios define the inputs used by GCAM-USA to simulate a wide range of compounding influences on interacting energy, water, and land systems over the course of the 21st century.
-    
-    </p>
-
-        <!-- add diagrams -->
-        <div class="grid-container w-screen">
-          {#each scenarioResources as diagram}
-            <button
-              class="grid-item"
-              title={diagram.tooltip}
-              on:click={() => openFullScreen(diagram.src, diagram.caption)}
-            >
-              <div class="grid-item-title">
-                {diagram.title}
-              </div>
-              <img src={diagram.src} alt={diagram.alt} class="w-full h-auto" />
-              <div class="grid-item-caption">
-                {diagram.caption}
-              </div>
-            </button>
+    <div class="overflow-x-auto mb-7">
+      <table class="min-w-full border border-gray-300 text-left text-slate-800">
+        <thead class="bg-gray-100">
+          <tr>
+            <th class="border border-gray-300 px-4 py-2 font-semibold">GCAM-USA Scenario names</th>
+            <th class="border border-gray-300 px-4 py-2 font-semibold">Emissions constraints</th>
+            <th class="border border-gray-300 px-4 py-2 font-semibold">Degree of hotter and drier weather*</th>
+            <th class="border border-gray-300 px-4 py-2 font-semibold">Population and economic growth</th>
+          </tr>
+        </thead>
+        <tbody>
+          {#each scenarioTable as row}
+            <tr>
+              <td class="border border-gray-300 px-4 py-2 font-medium">{row.name}</td>
+              <td class="border border-gray-300 px-4 py-2">{row.emissions}</td>
+              <td class="border border-gray-300 px-4 py-2">{row.weather}</td>
+              <td class="border border-gray-300 px-4 py-2">{row.population}</td>
+            </tr>
           {/each}
-        </div>
-    
-        {#if fullScreenImage}
-          <button
-            class="modal backdrop"
-            on:click={closeFullScreen}
-            aria-label="Full Screen Diagram"
-          >
-            <img src={fullScreenImage} alt="Full Screen Diagram" class="max-w-full max-h-3/4 shadow-lg rounded-md border border-gray-300" />
-            <div class="text-center text-gray-500 text-sm mt-4">{fullScreenCaption}</div>
-          </button>
-        {/if}
+        </tbody>
+      </table>
+    </div>
+
+    <p class="mb-4 text-slate-800 text-sm font-light">*This dashboard shows IM3 GCAM-USA results driven by 21<sup>st</sup> century projections of future hourly meteorology derived from monthly thermodynamic signals from CMIP6 projections. In addition to distinguishing between moderately versus severely hotter and drier futures (largely driven by emissions scenario assumptions), the projections account for structural model uncertainties that cause the projections to be relatively cooler or hotter for a given emissions trajectory. This produces a total of four 21<sup>st</sup> century projections. In this dashboard, however, for tractability purposes, we present GCAM-USA results only from the relatively cooler projection models.</p>
+
+    <p class="mb-7 text-slate-800 text-sm font-light">For additional information on the meteorological projections, please refer to: Jones, A.D., Rastogi, D., Vahmani, P., Stansfield, A., Reed, K.A., Thurber, T., Ullrich, P.A., & Rice, J.S. Continental United States climate projections based on thermodynamic modification of historical weather. <i>Sci Data</i> 10, 664 (2023). <a class='text-[#2B7F9E]' href="https://doi.org/10.1038/s41597-023-02485-5" target="_blank">https://doi.org/10.1038/s41597-023-02485-5</a></p>
+
+    <h2 class="mb-7 text-slate-800 text-2xl font-semibold">
+      {experimentDiagram.title}
+    </h2>
+    <hr class="border-1 border-gray-300">
+    <br>
+
+    <div class="w-3/5 mx-auto mb-7">
+      <img src={experimentDiagram.src} alt={experimentDiagram.alt} class="w-full h-auto" />
+    </div>
+
+    <p class="mb-7 text-slate-800 text-l font-light">For more information on IM3, please see <a class='text-[#2B7F9E]' href="https://im3.pnnl.gov" target="_blank">https://im3.pnnl.gov</a></p>
 
       <br>
     <!-- MODEL DOCUMENTATION -->
 
     <h2 class="mb-7 text-slate-800 text-2xl font-semibold">
-      Modeling 
+      Global Change Analysis Model - USA
     </h2>
     <hr class="border-1 border-gray-300">
-    
-      <h2 class="mb-5 mt-5 text-slate-800 text-xl font-semibold"> Global Change Analysis Model - USA </h2>
+    <br>
 
         <p class="mb-7 text-slate-800 text-l font-light"> The Global Change Analysis Model (GCAM) Wiki (version 5.3): <a class='text-[#2B7F9E]' href="https://jgcri.github.io/gcam-doc/v5.3/toc.html" target="_blank"> jgcri.github.io/gcam-doc/v5.3/toc.html</a> </p>
 

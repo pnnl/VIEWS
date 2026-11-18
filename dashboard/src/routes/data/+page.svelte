@@ -6,8 +6,8 @@
   import { base } from '$app/paths';
   import Icon from "@iconify/svelte";
 
-  const sspMapping = {'all': 'All', 'ssp3': 'Low', 'ssp5': 'High', };
-  const rcpMapping = { 'all': 'All', 'rcp45': 'Low', 'rcp85': 'High',};
+  const sspMapping = {'all': 'All', 'ssp3': 'Low', 'ssp5': 'High' };
+  const rcpMapping = { 'all': 'All', 'rcp45': 'Moderately hotter and drier', 'rcp85': 'Severely hotter and drier' };
   const climateMapping = { 'cooler': 'Cooler', 'hotter': 'Hotter', };
   const diagramMapping = {'Energy & Water': 'Integrated Energy & Water', 'Energy': 'Energy', 'Water': 'Water'};
   const waterUnitMapping = {'km3': 'Cubic Kilometers', 'billion_gallons': 'Billion Gallons', 'million_acre_ft': 'Million Acre-Feet'};
@@ -82,10 +82,12 @@
 
       const columnsToDownload = ["rcp", 'ssp', "source", "target", "year", "unit_value", "units", "diagram"];
 
+      const columnNames = { rcp: 'future_weather', ssp: 'population_gdp_growth' };
+      const valueMaps = { rcp: rcpMapping, ssp: sspMapping };
       const selectedData = rcpFilteredSubset.map(item => {
           let filteredItem = {};
           columnsToDownload.forEach(key => {
-              filteredItem[key] = item[key];
+              filteredItem[columnNames[key] ?? key] = valueMaps[key]?.[item[key]] ?? item[key];
           });
           return filteredItem;
           });
@@ -125,14 +127,14 @@
         </div>
 
         <div class="group flex relative">
-        <span>Fossil-fuel Emphasis Scenario</span> 
+        <span>Future Weather</span> 
         </div>
           
     </div>
 
-    <div class="flex-row leading-normal pl-10 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
+    <div class="flex-row leading-normal pl-10 font-light bg-[#FFFFFF] items-center gap-8 text-[#000000]">
       <fieldset>
-        <div class="flex flex-row gap-5">
+        <div class="flex flex-col gap-1">
           {#each rcps as r}
           <div>
             <input type="radio" id={r} name="rcps" value={r} bind:group={selectedRCP}/>
@@ -148,7 +150,7 @@
           <div class="grid mr-0 place-items-center">
           </div>
           <div class="group flex relative">
-          <span>Population & Economic Growth Scenario:</span> 
+          <span>Population & GDP Growth:</span> 
       </div>
   </div>
   <div class="flex leading-normal pl-10 font-light h-6 bg-[#FFFFFF] items-center gap-8 text-[#000000]">
