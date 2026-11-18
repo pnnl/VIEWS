@@ -100,7 +100,7 @@
         <p class="mb-7 text-slate-800 text-l font-light"> The motivation of the <a class='text-[#2B7F9E]' href="https://www.pnnl.gov/projects/integrated-water-power-resilience-project" target="_blank"> Integrated Water Power Resilience Project</a> is to identify and develop opportunities to improve resilience in the water and power sectors through coordinated planning, investment, and operations and thereby provide benefits to power and water utilities, consumers, and the environment. The project website provides access to other water and energy research supported under this project as well as previously developed historic Sankey diagrams of water and energy sectors at the aggregate US level and for each major US electricity interconnection.</p>
         <br>
         <a href="https://www.pnnl.gov/projects/integrated-water-power-resilience-project" target="_blank">
-          <img src="EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[150px]'/>
+          <img src="{base}/EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[150px]'/>
         </a>
         
         <br>
@@ -113,13 +113,13 @@
           </div>
           <div class="ml-4">
             <a href="https://www.pnnl.gov/projects/integrated-water-power-resilience-project" target="_blank">
-              <img src="EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[190px]'/>
+              <img src="{base}/EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[190px]'/>
             </a>
           </div>
         
           <!-- <div class="ml-4 flex justify-center items-center">
             <a href="https://www.pnnl.gov/projects/integrated-water-power-resilience-project" target="_blank">
-              <img src="EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[190px] transition-transform duration-200 hover:scale-105'/>
+              <img src="{base}/EED_1253_BRAND_WaterPowerResLogo-HERO-03.jpg" alt="iwpr-project-logo" class='h-[190px] transition-transform duration-200 hover:scale-105'/>
             </a>
           </div> -->
         
@@ -132,7 +132,7 @@
         </div>
         <div class="ml-20 mt-10">
           <a href="https://im3.pnnl.gov/" target="_blank">
-            <img src="IM3_logo.jpeg" alt="im3-project-logo" class='h-[140px] '/>
+            <img src="{base}/IM3_logo.jpeg" alt="im3-project-logo" class='h-[140px] '/>
           </a>
         </div>
         </div>

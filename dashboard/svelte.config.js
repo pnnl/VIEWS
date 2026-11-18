@@ -13,9 +13,11 @@ export default {
 			precompress: false,
 			strict: true
 		}),
+		// GitHub Pages serves the site under /VIEWS (main) and /VIEWS/dev (develop).
+		// The deploy workflow sets BASE_PATH per branch; production builds default to /VIEWS.
 		paths: {
-            base: process.env.NODE_ENV === 'production' ? '/VIEWS' : '',
-        },
+			base: process.env.BASE_PATH ?? (process.env.NODE_ENV === 'production' ? '/VIEWS' : '')
+		}
 	},
 	preprocess: vitePreprocess(),
 };
